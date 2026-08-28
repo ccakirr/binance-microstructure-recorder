@@ -230,7 +230,9 @@ procedure:
    updates in order → the book becomes `is_synced`.
 5. Every subsequent update is applied after a sequence continuity check. If a
    sequence gap is detected the book is invalidated (`invalidate_sync`) and
-   resynchronized from scratch.
+   resynchronized from step 2 — the websocket stays open, since a gap
+   invalidates the book, not the connection. A one second pause before the new
+   snapshot keeps repeated gaps from hammering the REST endpoint.
 
 Raw diff updates keep being written to parquet regardless of sync state, so no
 data is lost while recording.
@@ -244,6 +246,10 @@ Once synchronized, the live book can be inspected with `get_best_bid()`,
   others are unaffected and the dropped one reconnects after 3 seconds. Each
   symbol keeps its own order book, buffers and output directory.
 - The buffer is flushed to disk before reconnecting and on shutdown.
+- Parquet writes run in a worker thread (`asyncio.to_thread`), so a flush on
+  one stream does not stall `ws.recv()` — and therefore `local_receive_time` —
+  on the others. The shutdown flush stays synchronous on purpose, so it cannot
+  be interrupted by the cancellation that triggered it.
 - `Ctrl+C` cancels all tasks cleanly.
 
 ## Project layout

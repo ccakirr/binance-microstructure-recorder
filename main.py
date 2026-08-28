@@ -100,7 +100,11 @@ async def run_stream_collector(collector, parse, symbol: str, name: str):
                     if collector.add_to_buffer(record):
                         flushed = len(collector.buffer)
 
-                        collector.flush_buffer()
+                        # Parquet writing is synchronous CPU + disk work.
+                        # Running it in a thread keeps the event loop free,
+                        # so a flush here does not delay ws.recv() (and thus
+                        # local_receive_time) on every other stream.
+                        await asyncio.to_thread(collector.flush_buffer)
 
                         print(
                             f"[{symbol.upper()}] "
@@ -165,76 +169,79 @@ async def run_depth_collector(symbol: str, buffer_size: int):
                 async with websockets.connect(collector.ws_url) as ws:
                     print(f"[{symbol.upper()}] WebSocket connected.")
 
-                    first_message = await ws.recv()
-                    first_data = json.loads(first_message)
-                    first_depth = collector.parse_depth(first_data)
+                    resyncing = False
 
-                    collector.buffer_pending_update(first_depth)
-
-                    if collector.add_to_buffer(first_depth):
-                        collector.flush_buffer()
-
-                    snapshot = await collector.fetch_snapshot(session)
-
-                    collector.load_snapshot(snapshot)
-
-                    print(
-                        f"[{symbol.upper()}] Snapshot loaded | "
-                        f"lastUpdateId={collector.last_update_id} | "
-                        f"bids={len(collector.local_bids)} | "
-                        f"asks={len(collector.local_asks)}"
-                    )
-
-                    while not collector.is_synced:
-                        message = await ws.recv()
-                        data = json.loads(message)
-
-                        depth = collector.parse_depth(data)
-
-                        collector.buffer_pending_update(depth)
-
-                        if collector.add_to_buffer(depth):
-                            collector.flush_buffer()
-
-                        if collector.sync_pending_updates():
-                            print(
-                                f"[{symbol.upper()}] "
-                                f"Order book synchronized."
-                            )
-
-                            print(
-                                "Best bid:",
-                                collector.get_best_bid(),
-                            )
-
-                            print(
-                                "Best ask:",
-                                collector.get_best_ask(),
-                            )
-
-                            print(
-                                "Spread:",
-                                collector.get_spread(),
-                            )
-
+                    # Resync loop. A sequence gap only invalidates the local
+                    # book, not the connection, so it is enough to pull a
+                    # fresh snapshot here and keep the same websocket.
                     while True:
-                        message = await ws.recv()
-                        data = json.loads(message)
+                        if resyncing:
+                            await asyncio.sleep(1)
 
-                        depth = collector.parse_depth(data)
+                        snapshot = await collector.fetch_snapshot(session)
 
-                        if collector.add_to_buffer(depth):
-                            collector.flush_buffer()
+                        collector.load_snapshot(snapshot)
 
-                        success = collector.process_live_update(depth)
+                        print(
+                            f"[{symbol.upper()}] Snapshot loaded | "
+                            f"lastUpdateId={collector.last_update_id} | "
+                            f"bids={len(collector.local_bids)} | "
+                            f"asks={len(collector.local_asks)}"
+                        )
 
-                        if not success:
-                            print(
-                                f"[{symbol.upper()}] "
-                                f"Order book sync lost. Resyncing..."
-                            )
+                        while not collector.is_synced:
+                            message = await ws.recv()
+                            data = json.loads(message)
 
-                            break
+                            depth = collector.parse_depth(data)
+
+                            collector.buffer_pending_update(depth)
+
+                            if collector.add_to_buffer(depth):
+                                await asyncio.to_thread(collector.flush_buffer)
+
+                            if collector.sync_pending_updates():
+                                print(
+                                    f"[{symbol.upper()}] "
+                                    f"Order book synchronized."
+                                )
+
+                                print(
+                                    "Best bid:",
+                                    collector.get_best_bid(),
+                                )
+
+                                print(
+                                    "Best ask:",
+                                    collector.get_best_ask(),
+                                )
+
+                                print(
+                                    "Spread:",
+                                    collector.get_spread(),
+                                )
+
+                        while True:
+                            message = await ws.recv()
+                            data = json.loads(message)
+
+                            depth = collector.parse_depth(data)
+
+                            if collector.add_to_buffer(depth):
+                                await asyncio.to_thread(collector.flush_buffer)
+
+                            success = collector.process_live_update(depth)
+
+                            if not success:
+                                print(
+                                    f"[{symbol.upper()}] "
+                                    f"Order book sync lost. Resyncing "
+                                    f"(keeping the connection)..."
+                                )
+
+                                break
+
+                        resyncing = True
 
         except asyncio.CancelledError:
             flush_remaining(collector, symbol, "depth")

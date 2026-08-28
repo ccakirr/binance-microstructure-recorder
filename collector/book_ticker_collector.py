@@ -42,5 +42,5 @@ class BookTickerCollector:
         filename = f"book_ticker_{int(time.time() * 1000)}.parquet"
         file_path = self.data_path / filename
 
-        df.to_parquet(file_path)
+        df.to_parquet(file_path, index=False)
         self.buffer.clear()
