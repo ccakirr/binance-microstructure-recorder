@@ -43,6 +43,7 @@ BASE_BACKOFF_SECONDS = 3
 MAX_BACKOFF_SECONDS = 60
 SYNC_STALL_TIMEOUT_SECONDS = 30
 VALIDATION_TOLERANCE = 1e-8
+VALIDATION_STATS_INTERVAL_SECONDS = 60
 OPEN_INTEREST_POLL_SECONDS = 30
 TIME_SYNC_INTERVAL_SECONDS = 5 * 60
 EXCHANGE_INFO_INTERVAL_SECONDS = 24 * 60 * 60
@@ -379,7 +380,18 @@ async def run_futures_open_interest_collector(
         raise
 
 
-def validate_local_book(depth_collector, refs, event_logger):
+def new_validation_stats() -> dict:
+    return {
+        "book_ticker_checks": 0,
+        "book_ticker_found": 0,
+        "book_ticker_mismatches": 0,
+        "depth20_checks": 0,
+        "depth20_found": 0,
+        "depth20_mismatches": 0,
+    }
+
+
+def validate_local_book(depth_collector, refs, event_logger, stats: dict):
     """
     Cross-checks the locally reconstructed **spot** order book against
     independent spot references (bookTicker's best price, Binance's own
@@ -390,14 +402,21 @@ def validate_local_book(depth_collector, refs, event_logger):
     streams, so comparing them against the futures book would compare two
     different instruments and produce a constant, meaningless "mismatch".
 
-    Since book_ticker and depth20 arrive over separate connections, they are
-    virtually never from the exact same instant as the local book. Comparing
-    them whenever they happen to be checked would mostly compare stale
-    snapshots against each other and flag normal timing noise as a mismatch.
-    Instead, each reference carries the order-book update id it was current
-    as of, and it is only compared once that id lines up exactly with the
-    local book's last_update_id, i.e. only when they are genuinely the same
-    version of the book.
+    book_ticker/depth20 arrive over separate connections from the depth diff
+    stream, so by the time a depth update is processed here, ".latest" on
+    either of them has usually already moved past this exact update id --
+    comparing only against ".latest" would make genuine matches rare (worst
+    on the busiest symbols, where validation matters most), and "0
+    mismatches" would then quietly mean "0 checks" rather than "book
+    confirmed correct". Instead each reference keeps a short history keyed
+    by update id, and this looks up the id that matches the local book's
+    current last_update_id in that history, i.e. it finds the genuinely
+    same version of the book regardless of which one arrived "first".
+
+    `stats` is mutated with attempt/found/mismatch counters so a caller can
+    periodically report how much of this is actually landing a comparison
+    (see run_depth_collector's validation_stats event) instead of only
+    seeing silence and assuming everything's fine.
     """
 
     if event_logger is None or refs is None:
@@ -408,42 +427,52 @@ def validate_local_book(depth_collector, refs, event_logger):
     local_update_id = depth_collector.last_update_id
 
     book_ticker = refs.get("book_ticker")
+    stats["book_ticker_checks"] += 1
 
-    if (
-        book_ticker is not None
-        and book_ticker.latest is not None
-        and book_ticker.latest["update_id"] == local_update_id
-    ):
+    ref = book_ticker.history.get(local_update_id) if book_ticker is not None else None
+
+    if ref is not None:
+        stats["book_ticker_found"] += 1
+        mismatched = False
+
         if local_bid is not None:
-            diff = float(local_bid[0]) - float(book_ticker.latest["best_bid_price"])
+            diff = float(local_bid[0]) - float(ref["best_bid_price"])
             if abs(diff) > VALIDATION_TOLERANCE:
+                mismatched = True
                 log_event(
                     event_logger, "validation", "best_bid_mismatch",
                     f"update_id={local_update_id} local={local_bid[0]} "
-                    f"book_ticker={book_ticker.latest['best_bid_price']}",
+                    f"book_ticker={ref['best_bid_price']}",
                 )
 
         if local_ask is not None:
-            diff = float(local_ask[0]) - float(book_ticker.latest["best_ask_price"])
+            diff = float(local_ask[0]) - float(ref["best_ask_price"])
             if abs(diff) > VALIDATION_TOLERANCE:
+                mismatched = True
                 log_event(
                     event_logger, "validation", "best_ask_mismatch",
                     f"update_id={local_update_id} local={local_ask[0]} "
-                    f"book_ticker={book_ticker.latest['best_ask_price']}",
+                    f"book_ticker={ref['best_ask_price']}",
                 )
 
-    depth20 = refs.get("depth20")
+        if mismatched:
+            stats["book_ticker_mismatches"] += 1
 
-    if (
-        depth20 is not None
-        and depth20.latest is not None
-        and depth20.latest["last_update_id"] == local_update_id
-    ):
-        ref_bid = depth20.get_best_bid()
-        ref_ask = depth20.get_best_ask()
+    depth20 = refs.get("depth20")
+    stats["depth20_checks"] += 1
+
+    ref = depth20.history.get(local_update_id) if depth20 is not None else None
+
+    if ref is not None:
+        stats["depth20_found"] += 1
+        mismatched = False
+
+        ref_bid = Depth20Collector.best_bid_of(ref)
+        ref_ask = Depth20Collector.best_ask_of(ref)
 
         if local_bid is not None and ref_bid is not None:
             if abs(float(local_bid[0]) - float(ref_bid[0])) > VALIDATION_TOLERANCE:
+                mismatched = True
                 log_event(
                     event_logger, "validation", "depth20_bid_mismatch",
                     f"update_id={local_update_id} local={local_bid[0]} depth20={ref_bid[0]}",
@@ -451,10 +480,40 @@ def validate_local_book(depth_collector, refs, event_logger):
 
         if local_ask is not None and ref_ask is not None:
             if abs(float(local_ask[0]) - float(ref_ask[0])) > VALIDATION_TOLERANCE:
+                mismatched = True
                 log_event(
                     event_logger, "validation", "depth20_ask_mismatch",
                     f"update_id={local_update_id} local={local_ask[0]} depth20={ref_ask[0]}",
                 )
+
+        if mismatched:
+            stats["depth20_mismatches"] += 1
+
+
+def maybe_log_validation_stats(stats: dict, last_flush: list, event_logger):
+    """
+    Reports how much of validate_local_book's checking is actually landing
+    a comparison, once a minute. Without this, "0 mismatch" events in the
+    log are indistinguishable from "validation never found a matching id
+    and effectively never ran".
+    """
+
+    now = time.time()
+
+    if now - last_flush[0] < VALIDATION_STATS_INTERVAL_SECONDS:
+        return
+
+    last_flush[0] = now
+
+    log_event(
+        event_logger, "validation", "validation_stats",
+        f"book_ticker: {stats['book_ticker_found']}/{stats['book_ticker_checks']} "
+        f"matched, {stats['book_ticker_mismatches']} mismatches | "
+        f"depth20: {stats['depth20_found']}/{stats['depth20_checks']} matched, "
+        f"{stats['depth20_mismatches']} mismatches",
+    )
+
+    stats.update(new_validation_stats())
 
 
 async def run_depth_collector(
@@ -486,6 +545,8 @@ async def run_depth_collector(
 
     attempt = 0
     pending_writes = []
+    validation_stats = new_validation_stats()
+    validation_stats_last_flush = [time.time()]
 
     def maybe_flush_depth():
         if collector.should_flush_by_time(FLUSH_INTERVAL_SECONDS):
@@ -620,7 +681,14 @@ async def run_depth_collector(
                                     maybe_flush_snapshot()
 
                                 if market == "spot":
-                                    validate_local_book(collector, refs, event_logger)
+                                    validate_local_book(
+                                        collector, refs, event_logger, validation_stats
+                                    )
+                                    maybe_log_validation_stats(
+                                        validation_stats,
+                                        validation_stats_last_flush,
+                                        event_logger,
+                                    )
 
                             resyncing = True
 
@@ -863,8 +931,25 @@ async def main():
 
         if stopper not in done:
             # A task finished (crashed or returned) on its own, not via a
-            # signal -- record that distinction instead of mislabeling it.
-            stop_reason = "task_exited_unexpectedly"
+            # signal -- record which one and why. With Restart=always under
+            # systemd this is otherwise very hard to diagnose after the
+            # fact, since only the shutdown event survives the restart.
+            details = []
+
+            for task in done:
+                if task is stopper:
+                    continue
+
+                exc = task.exception() if not task.cancelled() else None
+
+                if exc is not None:
+                    details.append(
+                        f"{task.get_name()}: {type(exc).__name__}: {exc}"
+                    )
+                else:
+                    details.append(f"{task.get_name()}: exited without error")
+
+            stop_reason = "task_exited_unexpectedly (" + "; ".join(details) + ")"
 
     finally:
         stopper.cancel()

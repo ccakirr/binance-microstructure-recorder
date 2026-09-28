@@ -300,15 +300,21 @@ snapshot fetch instead.
   the reason (`SIGTERM`, `SIGINT` or `task_exited_unexpectedly`), so a gap at
   the end of a file can be told apart from an actual outage.
 - **Cross-validation** (spot only): `book_ticker` and `depth20` are separate
-  connections, so at any given instant they are virtually never in sync with
-  the locally reconstructed `depth` book — comparing them by wall-clock time
-  would mostly flag normal timing skew as a "mismatch". Instead, each
-  reference carries the order-book update id it is current as of, and it is
-  only compared once that id matches `depth`'s `last_update_id` exactly, i.e.
-  only when they are genuinely the same version of the book. Any mismatch at
-  that point is logged as a `validation` event. `futures_depth` is **not**
-  cross-checked against `book_ticker`/`depth20` — those are spot references,
-  and would permanently "mismatch" a perpetual's price.
+  connections, so by the time a `depth` update is processed here, their
+  `.latest` reading has usually already moved on to a newer update id —
+  comparing only against `.latest` would make genuine matches rare (worst on
+  the busiest symbols, where validation matters most) and hide a broken
+  check behind a reassuring "0 mismatches". Instead, `book_ticker` and
+  `depth20` each keep the last ~100 readings keyed by update id, and a
+  `depth` update is compared against whichever of those readings shares its
+  exact `last_update_id`, wherever it sits in that short history. Any
+  mismatch at that point is logged as a `validation` event, and once a
+  minute a `validation_stats` event reports how many `depth` updates were
+  checked against each reference and how many actually found a matching id
+  — so "0 mismatches" can be told apart from "0 checks landed".
+  `futures_depth` is **not** cross-checked against `book_ticker`/`depth20`
+  — those are spot references, and would permanently "mismatch" a
+  perpetual's price.
 - **Clock offset**: every 5 minutes, the `_GLOBAL` events stream records the
   difference between Binance's server clock (`/api/v3/time`) and the local
   clock, so latency figures computed from `local_receive_time` can be
@@ -339,6 +345,13 @@ snapshot fetch instead.
   Doing it the other way around would let the event logger exit before a
   producer's final event (e.g. a gap noticed while it's being torn down) is
   logged, silently dropping it.
+- The whole recorder is a single process today, so if any one task raises
+  instead of handling its own errors, `main()` treats that as a fatal signal
+  and shuts everything down — run it under `systemd` with `Restart=always`
+  (or an equivalent supervisor) if you want it to come back automatically.
+  The `shutdown` event records exactly which task raised and its exception
+  (as opposed to a normal `SIGTERM`/`SIGINT`), so a crash loop is easy to
+  diagnose from the event log alone.
 - Parquet files are written with `zstd` compression and tagged with the
   recorder's git commit hash in their schema metadata, so any file can be
   traced back to the exact code version that produced it.

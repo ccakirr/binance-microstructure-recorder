@@ -1,5 +1,6 @@
 import time
 import uuid
+from collections import deque
 from pathlib import Path
 
 import pandas as pd
@@ -7,6 +8,40 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from collector.version import get_git_commit
+
+
+class UpdateIdHistory:
+    """
+    Keeps the last `maxlen` records a stream produced, keyed by their
+    update id, so a consumer on a *different* connection can look one up by
+    id instead of by "whatever is latest right now".
+
+    This matters for cross-validation: book_ticker/depth20 arrive over
+    separate websocket connections from the depth diff stream, so by the
+    time a depth update is processed, `.latest` on either of them has
+    usually already moved on to a newer id. Comparing only against
+    `.latest` would make genuine matches rare (worst on the most active
+    symbols, where validation matters most) and "0 mismatches" would
+    quietly mean "0 checks" instead of "book confirmed correct". Searching a
+    short window of recent ids instead of a single latest one makes the
+    connections' timing difference irrelevant.
+    """
+
+    def __init__(self, maxlen: int = 100):
+        self._maxlen = maxlen
+        self._order = deque()
+        self._by_id = {}
+
+    def add(self, update_id, record):
+        self._order.append(update_id)
+        self._by_id[update_id] = record
+
+        while len(self._order) > self._maxlen:
+            oldest = self._order.popleft()
+            self._by_id.pop(oldest, None)
+
+    def get(self, update_id):
+        return self._by_id.get(update_id)
 
 
 class BaseCollector:

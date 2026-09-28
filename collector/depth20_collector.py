@@ -1,7 +1,7 @@
 import time
 from pathlib import Path
 
-from collector.base_collector import BaseCollector
+from collector.base_collector import BaseCollector, UpdateIdHistory
 
 
 class Depth20Collector(BaseCollector):
@@ -30,7 +30,11 @@ class Depth20Collector(BaseCollector):
             f"wss://stream.binance.com:9443/ws/{self.symbol}@depth20@100ms"
         )
 
+        # Latest reading, plus a short by-id history, kept for cross-checking
+        # against the locally reconstructed order book from the depth
+        # stream (see UpdateIdHistory for why "latest" alone isn't enough).
         self.latest = None
+        self.history = UpdateIdHistory(maxlen=100)
 
     def parse_depth20(self, data: dict) -> dict:
         record = {
@@ -41,17 +45,26 @@ class Depth20Collector(BaseCollector):
         }
 
         self.latest = record
+        self.history.add(record["last_update_id"], record)
 
         return record
 
-    def get_best_bid(self):
-        if not self.latest or not self.latest["bids"]:
+    @staticmethod
+    def best_bid_of(record):
+        if not record or not record["bids"]:
             return None
 
-        return tuple(self.latest["bids"][0])
+        return tuple(record["bids"][0])
+
+    @staticmethod
+    def best_ask_of(record):
+        if not record or not record["asks"]:
+            return None
+
+        return tuple(record["asks"][0])
+
+    def get_best_bid(self):
+        return self.best_bid_of(self.latest)
 
     def get_best_ask(self):
-        if not self.latest or not self.latest["asks"]:
-            return None
-
-        return tuple(self.latest["asks"][0])
+        return self.best_ask_of(self.latest)

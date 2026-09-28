@@ -1,7 +1,7 @@
 import time
 from pathlib import Path
 
-from collector.base_collector import BaseCollector
+from collector.base_collector import BaseCollector, UpdateIdHistory
 
 
 class BookTickerCollector(BaseCollector):
@@ -21,9 +21,11 @@ class BookTickerCollector(BaseCollector):
 
         self.ws_url = f"wss://stream.binance.com:9443/ws/{self.symbol}@bookTicker"
 
-        # Latest reading, kept for cross-checking against the locally
-        # reconstructed order book from the depth stream.
+        # Latest reading, plus a short by-id history, kept for cross-checking
+        # against the locally reconstructed order book from the depth
+        # stream (see UpdateIdHistory for why "latest" alone isn't enough).
         self.latest = None
+        self.history = UpdateIdHistory(maxlen=100)
 
     def parse_book_ticker(self, data: dict) -> dict:
         record = {
@@ -36,5 +38,6 @@ class BookTickerCollector(BaseCollector):
         }
 
         self.latest = record
+        self.history.add(record["update_id"], record)
 
         return record
