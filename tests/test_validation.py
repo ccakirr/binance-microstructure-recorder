@@ -26,12 +26,24 @@ class FakeDepth:
         self._ask = ask
         self.last_update_id = update_id
         self.top_history = UpdateIdHistory(window_seconds=5.0)
+        self.depth20_resolved_ids = UpdateIdHistory(window_seconds=10.0)
 
     def get_best_bid(self):
         return self._bid
 
     def get_best_ask(self):
         return self._ask
+
+
+class FakeDepth20History:
+    """A depth20 stream stand-in exposing just the `.history` lookup
+    validate_local_book needs (keyed by lastUpdateId)."""
+
+    def __init__(self):
+        self.history = UpdateIdHistory(window_seconds=5.0)
+
+    def push(self, update_id, record):
+        self.history.add(update_id, record)
 
 
 def make_depth20_record(update_id, bid, ask):
@@ -111,17 +123,51 @@ def test_validate_local_book_ignores_a_newer_book_ticker_latest_reading():
     assert logger.events == []
 
 
-def test_validate_depth20_finds_a_local_top_recorded_earlier_by_depth():
+def test_depth20_arriving_after_depth_is_matched_and_counted_once():
+    # depth reaches update id 100 first (depth20 not running yet from
+    # validate_local_book's point of view -- no depth20 ref registered),
+    # then the depth20 message for that same id arrives afterwards.
+    depth = FakeDepth(("10.0", "1"), ("10.1", "1"), 100)
+    depth20 = FakeDepth20History()
+    logger = RecordingLogger()
+    stats = m.new_validation_stats()
+
+    m.validate_local_book(depth, {"depth20": depth20}, logger, stats)
+    assert stats["depth20_checks"] == 1
+    assert stats["depth20_found"] == 0  # depth20 hasn't arrived yet
+
+    record = make_depth20_record(100, "10.0", "10.1")
+    depth20.push(100, record)
+    m.validate_depth20_against_local(record, {"depth": depth}, logger, stats)
+
+    # depth20_checks must not be incremented a second time by the depth20
+    # side -- it's only counted once, from the depth side.
+    assert stats["depth20_checks"] == 1
+    assert stats["depth20_found"] == 1
+    assert stats["depth20_mismatches"] == 0
+    assert logger.events == []
+
+
+def test_depth20_arriving_before_depth_is_still_matched_previously_missed_case():
+    # depth20's message for update id 100 arrives *before* depth itself has
+    # processed that id -- validate_local_book alone would never catch
+    # this; it depends on validate_depth20_against_local looking the id up
+    # in depth's top_history once depth records it.
     depth = FakeDepth(("10.0", "1"), ("10.1", "1"), 100)
     logger = RecordingLogger()
     stats = m.new_validation_stats()
 
-    # Simulate depth having already processed update id 100 before the
-    # depth20 snapshot for that same id arrives.
-    m.validate_local_book(depth, {}, logger, stats)
-
     record = make_depth20_record(100, "10.0", "10.1")
     m.validate_depth20_against_local(record, {"depth": depth}, logger, stats)
+
+    # depth hasn't reached id 100 yet -- nothing to compare against, and
+    # nothing counted (counting happens from the depth side).
+    assert stats["depth20_checks"] == 0
+    assert stats["depth20_found"] == 0
+
+    depth20 = FakeDepth20History()
+    depth20.push(100, record)
+    m.validate_local_book(depth, {"depth20": depth20}, logger, stats)
 
     assert stats["depth20_checks"] == 1
     assert stats["depth20_found"] == 1
@@ -129,14 +175,18 @@ def test_validate_depth20_finds_a_local_top_recorded_earlier_by_depth():
     assert logger.events == []
 
 
-def test_validate_depth20_logs_a_mismatch_for_a_matching_id_with_different_price():
+def test_depth20_mismatch_is_logged_regardless_of_arrival_order():
     depth = FakeDepth(("10.0", "1"), ("10.1", "1"), 100)
     logger = RecordingLogger()
     stats = m.new_validation_stats()
-    m.validate_local_book(depth, {}, logger, stats)
 
+    # depth20 arrives first with a genuinely different price.
     record = make_depth20_record(100, "12.0", "12.1")
     m.validate_depth20_against_local(record, {"depth": depth}, logger, stats)
+
+    depth20 = FakeDepth20History()
+    depth20.push(100, record)
+    m.validate_local_book(depth, {"depth20": depth20}, logger, stats)
 
     assert stats["depth20_mismatches"] == 1
     event_types = {event_type for _, event_type, _ in logger.events}

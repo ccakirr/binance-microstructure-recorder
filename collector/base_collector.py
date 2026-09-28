@@ -41,10 +41,17 @@ class UpdateIdHistory:
         self._max_records = max_records
         self._order = deque()  # (monotonic_time, update_id)
         self._by_id = {}
+        # How many still-live entries in `_order` reference each id. Needed
+        # because the same update_id can be add()-ed more than once (e.g. a
+        # skipped/replayed depth update); without this, evicting the older
+        # of two entries for the same id would also delete `_by_id[id]`,
+        # wiping out the newer, still-current one too.
+        self._counts = {}
 
     def add(self, update_id, record):
         now = time.monotonic()
         self._order.append((now, update_id))
+        self._counts[update_id] = self._counts.get(update_id, 0) + 1
         self._by_id[update_id] = record
         self._evict(now)
 
@@ -54,7 +61,13 @@ class UpdateIdHistory:
             or len(self._order) > self._max_records
         ):
             _, oldest_id = self._order.popleft()
-            self._by_id.pop(oldest_id, None)
+            remaining = self._counts[oldest_id] - 1
+
+            if remaining <= 0:
+                del self._counts[oldest_id]
+                self._by_id.pop(oldest_id, None)
+            else:
+                self._counts[oldest_id] = remaining
 
     def get(self, update_id):
         return self._by_id.get(update_id)

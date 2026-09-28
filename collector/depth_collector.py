@@ -54,6 +54,13 @@ class DepthCollector(BaseCollector):
         # instead of only being checked at the instant the local book
         # itself happens to reach that id.
         self.top_history = UpdateIdHistory(window_seconds=5.0)
+
+        # Marks which update ids have already had their depth20 comparison
+        # resolved, so main.py's validate_local_book/
+        # validate_depth20_against_local -- which check the same id from
+        # opposite directions, since either message can arrive first --
+        # don't double-count or double-log the same comparison.
+        self.depth20_resolved_ids = UpdateIdHistory(window_seconds=10.0)
         self.local_asks = SortedDict()
         self.is_synced = False
 

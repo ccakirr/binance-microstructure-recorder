@@ -309,16 +309,23 @@ snapshot fetch instead.
   count — a busy symbol's `book_ticker` alone can emit hundreds of messages
   a second, so a fixed count could cover well under a second), and each
   `depth` update looks itself up in that history by id. `depth20` is
-  checked the other way around: `depth` keeps its own ~5-second,
-  id-keyed history of its top of book, and each incoming `depth20` snapshot
-  looks *itself* up in there — since `depth20` is also 100ms-batched on its
-  own connection, it just as often arrives after `depth` already passed the
-  matching id as before it, and checking in only one direction would miss
-  that entire other half. Any mismatch found either way is logged as a
-  `validation` event, and once a minute a `validation_stats` event reports
-  how many updates were checked against each reference (only while that
-  reference stream is actually running) and how many actually found a
-  matching id — so "0 mismatches" can be told apart from "0 checks landed".
+  checked in both directions at once, because it's just as 100ms-batched
+  and just as likely to arrive before `depth` reaches a given id as after:
+  `depth` keeps its own ~10-second, id-keyed history of its top of book, and
+  whichever side sees both readings for an id first resolves the check —
+  either a `depth` update finds that id already sitting in `depth20`'s
+  history, or a later `depth20` snapshot finds that id already sitting in
+  `depth`'s history. A small dedup set (keyed by update id, same
+  time-boxed structure as the histories) makes sure each id's comparison is
+  only counted and logged once even though both directions try to resolve
+  it. Any mismatch found either way is logged as a `validation` event, and
+  once a minute a `validation_stats` event reports how many updates were
+  checked against each reference (only while that reference stream is
+  actually running) and how many actually found a matching id — so "0
+  mismatches" can be told apart from "0 checks landed". `depth20_checks` is
+  incremented once per `depth` update (mirroring `book_ticker_checks`),
+  regardless of which side ends up resolving the match, so the two
+  denominators stay comparable.
   Note that `book_ticker` only pushes a message when the best bid/ask
   itself changes, so most `depth` updates (which also touch deeper levels)
   will never have a `book_ticker` message at their exact id — a low
@@ -427,12 +434,20 @@ sequences rather than live connections.
   streams for the same symbol; it logs mismatches as events but does not
   attempt to correct the local book itself. `futures_depth` has no
   equivalent reference stream to validate against. Measured with
-  `validation_stats`: on a busy symbol (BTCUSDT) the `depth20` match rate
-  was only ~5-15%, versus ~90% on a quiet one (XRPUSDT). The local book
-  only keeps the top-of-book *after* each grouped diff message is applied,
-  not for every individual update id inside that message's
-  `[first_update_id, final_update_id]` range — on a busy symbol a single
-  100ms diff message can span hundreds of ids, so `depth20`'s
+  `validation_stats` before the check was made bidirectional: on a busy
+  symbol (BTCUSDT) the `depth20` match rate was only ~5-15%, versus ~90% on
+  a quiet one (XRPUSDT) — most of that gap turned out to be the
+  previously-missed "depth20 arrives before depth" case, not a deeper
+  problem: a short (~30s) re-run on BTCUSDT after checking both arrival
+  orders showed the `depth20` match rate at ~100%, still with 0 mismatches.
+  That is one short sample, not a rigorous re-measurement — re-check with
+  `validation_stats` over a longer run before relying on it, since a
+  separate, direction-independent limitation can still suppress matches
+  during bursts: the local book only keeps the top-of-book *after* each
+  grouped diff message is applied, not for every individual update id
+  inside that message's `[first_update_id, final_update_id]` range — on a
+  busy symbol a single 100ms diff message can span hundreds of ids, so
+  `depth20`'s
   `lastUpdateId` frequently lands in the middle of that range rather than
   exactly on `final_update_id`, and is never found. The check still never
   produces a false mismatch, but on busy symbols it should be read as "no
