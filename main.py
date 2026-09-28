@@ -276,8 +276,17 @@ async def run_depth20_collector(
     if refs is not None:
         refs["depth20"] = collector
 
+    def parse_and_check(data: dict) -> dict:
+        record = collector.parse_depth20(data)
+
+        if refs is not None:
+            stats = refs.setdefault("validation_stats", new_validation_stats())
+            validate_depth20_against_local(record, refs, event_logger, stats)
+
+        return record
+
     await run_stream_collector(
-        collector, collector.parse_depth20, symbol, "depth20", event_logger
+        collector, parse_and_check, symbol, "depth20", event_logger
     )
 
 
@@ -394,24 +403,36 @@ def new_validation_stats() -> dict:
 def validate_local_book(depth_collector, refs, event_logger, stats: dict):
     """
     Cross-checks the locally reconstructed **spot** order book against
-    independent spot references (bookTicker's best price, Binance's own
-    depth20 snapshot) and logs a validation event on any mismatch beyond
-    floating point noise.
+    bookTicker's best price and logs a validation event on any mismatch
+    beyond floating point noise.
 
-    Only called for the spot depth collector: bookTicker/depth20 are spot
-    streams, so comparing them against the futures book would compare two
-    different instruments and produce a constant, meaningless "mismatch".
+    Only called for the spot depth collector: book_ticker is a spot stream,
+    so comparing it against the futures book would compare two different
+    instruments and produce a constant, meaningless "mismatch".
 
-    book_ticker/depth20 arrive over separate connections from the depth diff
-    stream, so by the time a depth update is processed here, ".latest" on
-    either of them has usually already moved past this exact update id --
-    comparing only against ".latest" would make genuine matches rare (worst
-    on the busiest symbols, where validation matters most), and "0
-    mismatches" would then quietly mean "0 checks" rather than "book
-    confirmed correct". Instead each reference keeps a short history keyed
-    by update id, and this looks up the id that matches the local book's
-    current last_update_id in that history, i.e. it finds the genuinely
-    same version of the book regardless of which one arrived "first".
+    book_ticker arrives over a separate connection from the depth diff
+    stream, so by the time a depth update is processed here, its ".latest"
+    has usually already moved past this exact update id -- comparing only
+    against ".latest" would make genuine matches rare (worst on the busiest
+    symbols, where validation matters most), and "0 mismatches" would then
+    quietly mean "0 checks" rather than "book confirmed correct". Instead
+    book_ticker keeps a short history keyed by update id, and this looks up
+    the id that matches the local book's current last_update_id in that
+    history, i.e. it finds the genuinely same version of the book
+    regardless of which one arrived "first". book_ticker only pushes a
+    message when the top of book actually changes, so it will never have an
+    entry for an id that only touched a deeper level -- a low match rate
+    here is expected and is not itself a sign of a problem; see
+    maybe_log_validation_stats.
+
+    The local top-of-book is also recorded into depth_collector.top_history
+    keyed by this same update id, so the depth20 stream (batched every
+    100ms, just like depth, but on its own connection) can look the local
+    book up from *its* side too when a depth20 message arrives -- see
+    validate_depth20_against_local. Checking only in this direction would
+    miss every case where a depth20 message happens to arrive after the
+    local book has already moved past its id, which is routine for the two
+    independent 100ms streams.
 
     `stats` is mutated with attempt/found/mismatch counters so a caller can
     periodically report how much of this is actually landing a comparison
@@ -419,75 +440,103 @@ def validate_local_book(depth_collector, refs, event_logger, stats: dict):
     seeing silence and assuming everything's fine.
     """
 
-    if event_logger is None or refs is None:
-        return
-
     local_bid = depth_collector.get_best_bid()
     local_ask = depth_collector.get_best_ask()
     local_update_id = depth_collector.last_update_id
 
+    depth_collector.top_history.add(local_update_id, (local_bid, local_ask))
+
+    if event_logger is None or refs is None:
+        return
+
     book_ticker = refs.get("book_ticker")
+
+    if book_ticker is None:
+        return
+
     stats["book_ticker_checks"] += 1
+    ref = book_ticker.history.get(local_update_id)
 
-    ref = book_ticker.history.get(local_update_id) if book_ticker is not None else None
+    if ref is None:
+        return
 
-    if ref is not None:
-        stats["book_ticker_found"] += 1
-        mismatched = False
+    stats["book_ticker_found"] += 1
+    mismatched = False
 
-        if local_bid is not None:
-            diff = float(local_bid[0]) - float(ref["best_bid_price"])
-            if abs(diff) > VALIDATION_TOLERANCE:
-                mismatched = True
-                log_event(
-                    event_logger, "validation", "best_bid_mismatch",
-                    f"update_id={local_update_id} local={local_bid[0]} "
-                    f"book_ticker={ref['best_bid_price']}",
-                )
+    if local_bid is not None:
+        diff = float(local_bid[0]) - float(ref["best_bid_price"])
+        if abs(diff) > VALIDATION_TOLERANCE:
+            mismatched = True
+            log_event(
+                event_logger, "validation", "best_bid_mismatch",
+                f"update_id={local_update_id} local={local_bid[0]} "
+                f"book_ticker={ref['best_bid_price']}",
+            )
 
-        if local_ask is not None:
-            diff = float(local_ask[0]) - float(ref["best_ask_price"])
-            if abs(diff) > VALIDATION_TOLERANCE:
-                mismatched = True
-                log_event(
-                    event_logger, "validation", "best_ask_mismatch",
-                    f"update_id={local_update_id} local={local_ask[0]} "
-                    f"book_ticker={ref['best_ask_price']}",
-                )
+    if local_ask is not None:
+        diff = float(local_ask[0]) - float(ref["best_ask_price"])
+        if abs(diff) > VALIDATION_TOLERANCE:
+            mismatched = True
+            log_event(
+                event_logger, "validation", "best_ask_mismatch",
+                f"update_id={local_update_id} local={local_ask[0]} "
+                f"book_ticker={ref['best_ask_price']}",
+            )
 
-        if mismatched:
-            stats["book_ticker_mismatches"] += 1
+    if mismatched:
+        stats["book_ticker_mismatches"] += 1
 
-    depth20 = refs.get("depth20")
+
+def validate_depth20_against_local(depth20_record, refs, event_logger, stats: dict):
+    """
+    The depth20 counterpart of validate_local_book's book_ticker check: for
+    each depth20 snapshot received, looks its lastUpdateId up in the spot
+    depth collector's top_history (see validate_local_book) instead of
+    comparing against the local book's current state. See
+    validate_local_book's docstring for why this needs to run in both
+    directions.
+    """
+
+    if event_logger is None or refs is None:
+        return
+
+    depth_collector = refs.get("depth")
+
+    if depth_collector is None:
+        return
+
     stats["depth20_checks"] += 1
+    update_id = depth20_record["last_update_id"]
+    local_top = depth_collector.top_history.get(update_id)
 
-    ref = depth20.history.get(local_update_id) if depth20 is not None else None
+    if local_top is None:
+        return
 
-    if ref is not None:
-        stats["depth20_found"] += 1
-        mismatched = False
+    stats["depth20_found"] += 1
+    local_bid, local_ask = local_top
+    mismatched = False
 
-        ref_bid = Depth20Collector.best_bid_of(ref)
-        ref_ask = Depth20Collector.best_ask_of(ref)
+    ref_bid = Depth20Collector.best_bid_of(depth20_record)
+    ref_ask = Depth20Collector.best_ask_of(depth20_record)
 
-        if local_bid is not None and ref_bid is not None:
-            if abs(float(local_bid[0]) - float(ref_bid[0])) > VALIDATION_TOLERANCE:
-                mismatched = True
-                log_event(
-                    event_logger, "validation", "depth20_bid_mismatch",
-                    f"update_id={local_update_id} local={local_bid[0]} depth20={ref_bid[0]}",
-                )
+    if local_bid is not None and ref_bid is not None:
+        if abs(float(local_bid[0]) - float(ref_bid[0])) > VALIDATION_TOLERANCE:
+            mismatched = True
+            log_event(
+                event_logger, "validation", "depth20_bid_mismatch",
+                f"update_id={update_id} local={local_bid[0]} depth20={ref_bid[0]}",
+            )
 
-        if local_ask is not None and ref_ask is not None:
-            if abs(float(local_ask[0]) - float(ref_ask[0])) > VALIDATION_TOLERANCE:
-                mismatched = True
-                log_event(
-                    event_logger, "validation", "depth20_ask_mismatch",
-                    f"update_id={local_update_id} local={local_ask[0]} depth20={ref_ask[0]}",
-                )
+    if local_ask is not None and ref_ask is not None:
+        if abs(float(local_ask[0]) - float(ref_ask[0])) > VALIDATION_TOLERANCE:
+            mismatched = True
+            log_event(
+                event_logger, "validation", "depth20_ask_mismatch",
+                f"update_id={update_id} local={local_ask[0]} depth20={ref_ask[0]}",
+            )
 
-        if mismatched:
-            stats["depth20_mismatches"] += 1
+    if mismatched:
+        stats["depth20_mismatches"] += 1
 
 
 def maybe_log_validation_stats(stats: dict, last_flush: list, event_logger):
@@ -545,8 +594,18 @@ async def run_depth_collector(
 
     attempt = 0
     pending_writes = []
-    validation_stats = new_validation_stats()
-    validation_stats_last_flush = [time.time()]
+
+    # Shared with run_depth20_collector (via refs) so depth20-triggered
+    # checks (validate_depth20_against_local) count towards the same
+    # depth20_* stats as the checks triggered here.
+    if market == "spot" and refs is not None:
+        validation_stats = refs.setdefault("validation_stats", new_validation_stats())
+        validation_stats_last_flush = refs.setdefault(
+            "validation_stats_last_flush", [time.time()]
+        )
+    else:
+        validation_stats = new_validation_stats()
+        validation_stats_last_flush = [time.time()]
 
     def maybe_flush_depth():
         if collector.should_flush_by_time(FLUSH_INTERVAL_SECONDS):

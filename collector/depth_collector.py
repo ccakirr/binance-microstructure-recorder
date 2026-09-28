@@ -4,7 +4,7 @@ from pathlib import Path
 import aiohttp
 from sortedcontainers import SortedDict
 
-from collector.base_collector import BaseCollector
+from collector.base_collector import BaseCollector, UpdateIdHistory
 
 
 class DepthCollector(BaseCollector):
@@ -47,6 +47,13 @@ class DepthCollector(BaseCollector):
         # precision/formatting from the exchange is never lost.
         self.last_update_id = None
         self.local_bids = SortedDict()
+
+        # Best bid/ask kept by update id (see UpdateIdHistory), used so a
+        # slower/100ms-batched reference stream like depth20 can look up
+        # "what was the local book at id X" for whichever id it references,
+        # instead of only being checked at the instant the local book
+        # itself happens to reach that id.
+        self.top_history = UpdateIdHistory(window_seconds=5.0)
         self.local_asks = SortedDict()
         self.is_synced = False
 

@@ -34,7 +34,7 @@ class Depth20Collector(BaseCollector):
         # against the locally reconstructed order book from the depth
         # stream (see UpdateIdHistory for why "latest" alone isn't enough).
         self.latest = None
-        self.history = UpdateIdHistory(maxlen=100)
+        self.history = UpdateIdHistory(window_seconds=5.0)
 
     def parse_depth20(self, data: dict) -> dict:
         record = {

@@ -12,9 +12,9 @@ from collector.version import get_git_commit
 
 class UpdateIdHistory:
     """
-    Keeps the last `maxlen` records a stream produced, keyed by their
-    update id, so a consumer on a *different* connection can look one up by
-    id instead of by "whatever is latest right now".
+    Keeps the records a stream produced over the last `window_seconds`,
+    keyed by their update id, so a consumer on a *different* connection can
+    look one up by id instead of by "whatever is latest right now".
 
     This matters for cross-validation: book_ticker/depth20 arrive over
     separate websocket connections from the depth diff stream, so by the
@@ -25,20 +25,36 @@ class UpdateIdHistory:
     quietly mean "0 checks" instead of "book confirmed correct". Searching a
     short window of recent ids instead of a single latest one makes the
     connections' timing difference irrelevant.
+
+    The window is time-based rather than a fixed record count: on a busy
+    symbol, book_ticker alone can emit hundreds of messages a second, so a
+    fixed count (e.g. 100) can cover well under a second of history -- too
+    short to still contain the id a slightly-delayed depth/depth20 packet
+    needs, in exactly the busy symbols where validation matters most.
+    `max_records` is only a safety cap against unbounded memory use if a
+    stream misbehaves; under normal conditions it is `window_seconds` that
+    determines how far back a lookup can reach.
     """
 
-    def __init__(self, maxlen: int = 100):
-        self._maxlen = maxlen
-        self._order = deque()
+    def __init__(self, window_seconds: float = 5.0, max_records: int = 20000):
+        self._window_seconds = window_seconds
+        self._max_records = max_records
+        self._order = deque()  # (monotonic_time, update_id)
         self._by_id = {}
 
     def add(self, update_id, record):
-        self._order.append(update_id)
+        now = time.monotonic()
+        self._order.append((now, update_id))
         self._by_id[update_id] = record
+        self._evict(now)
 
-        while len(self._order) > self._maxlen:
-            oldest = self._order.popleft()
-            self._by_id.pop(oldest, None)
+    def _evict(self, now):
+        while self._order and (
+            now - self._order[0][0] > self._window_seconds
+            or len(self._order) > self._max_records
+        ):
+            _, oldest_id = self._order.popleft()
+            self._by_id.pop(oldest_id, None)
 
     def get(self, update_id):
         return self._by_id.get(update_id)
