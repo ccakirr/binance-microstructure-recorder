@@ -1,4 +1,5 @@
 import time
+import uuid
 from pathlib import Path
 
 import pandas as pd
@@ -84,7 +85,13 @@ class BaseCollector:
 
         self.ensure_data_path()
 
-        filename = f"{self.stream_name}_{int(time.time() * 1000)}.parquet"
+        # A uuid suffix keeps two flushes landing in the same millisecond
+        # (small buffer sizes, several streams flushing at once) from
+        # overwriting each other.
+        filename = (
+            f"{self.stream_name}_{int(time.time() * 1000)}_"
+            f"{uuid.uuid4().hex[:8]}.parquet"
+        )
         file_path = self.data_path / filename
 
         table = pa.Table.from_pandas(df, preserve_index=False)

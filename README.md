@@ -15,14 +15,14 @@ one or more symbols at a time:
 | `futures_depth` | futures | `<symbol>@depth@100ms` | Same as `depth`, for the perpetual, using futures' `pu`-based sync rules |
 | `futures_agg_trade` | futures | `<symbol>@aggTrade` | Aggregated perp trades |
 | `futures_mark_price` | futures | `<symbol>@markPrice@1s` | Mark price, index price, funding rate |
-| `futures_liquidation` | futures | `<symbol>@forceOrder` | Forced liquidation orders |
+| `futures_liquidation` | futures | `<symbol>@forceOrder` | Forced liquidation orders (**sample, not exhaustive** -- see Known limitations) |
 | `futures_open_interest` | futures | REST poll, `/fapi/v1/openInterest` | Open interest (no push stream exists) |
 
 `depth` and `futures_depth` also write two side files per symbol: a
 per-second top-20 **snapshot** of the reconstructed book (`snapshots/`), and
 an **events** log (`events/`) recording connects, disconnects, resyncs,
-sequence gaps and cross-checks against `book_ticker`/`depth20`. A `GLOBAL`
-events stream additionally records periodic clock-offset checks against
+sequence gaps and (spot-only) cross-checks against `book_ticker`/`depth20`.
+A `_GLOBAL` events stream additionally records periodic clock-offset checks against
 Binance's server time, and `exchange_info/` stores a daily snapshot of tick
 size / lot size / trading status for the tracked symbols. Every parquet file
 carries the recorder's git commit hash in its metadata.
@@ -157,14 +157,15 @@ hand. Spot streams live under `data/raw`, futures streams under
 data/
 ├── raw/
 │   ├── XRPUSDT/
-│   │   ├── trades/       trades_<ms>.parquet
-│   │   ├── book_ticker/  book_ticker_<ms>.parquet
-│   │   ├── depth/        depth_<ms>.parquet
-│   │   ├── depth20/      depth20_<ms>.parquet
-│   │   ├── snapshots/    snapshots_<ms>.parquet   (top-20 of the local book, 1/s)
-│   │   └── events/       events_<ms>.parquet      (connects, gaps, resyncs, validation)
-│   ├── GLOBAL/events/                              (clock offset checks)
-│   └── _GLOBAL/exchange_info/                      (daily tick/lot size snapshot)
+│   │   ├── trades/       trades_<ms>_<uuid>.parquet
+│   │   ├── book_ticker/  book_ticker_<ms>_<uuid>.parquet
+│   │   ├── depth/        depth_<ms>_<uuid>.parquet
+│   │   ├── depth20/      depth20_<ms>_<uuid>.parquet
+│   │   ├── snapshots/    snapshots_<ms>_<uuid>.parquet   (top-20 of the local book, 1/s)
+│   │   └── events/       events_<ms>_<uuid>.parquet      (connects, gaps, resyncs, validation)
+│   └── _GLOBAL/
+│       ├── events/         (clock offset checks, shutdown/exit reason)
+│       └── exchange_info/  (daily tick/lot size snapshot)
 └── raw_futures/
     └── BTCUSDT/
         ├── depth/  agg_trades/  mark_price/  liquidations/  open_interest/
@@ -290,16 +291,25 @@ snapshot fetch instead.
 - **Snapshots** (`snapshots/`): once a second, the top 20 levels of the
   synced local book are captured independently of the raw diff stream — a
   cheap, directly-readable reference for research.
-- **Events** (`events/`, per symbol, plus a `GLOBAL` stream): every connect,
+- **Events** (`events/`, per symbol, plus a `_GLOBAL` stream): every connect,
   disconnect, resync, sequence gap and validation mismatch is recorded with a
   timestamp, so a `check_data_quality`-style script has structured data to
-  read instead of grepping logs. Trade id gaps are also detected and logged
-  the instant they happen, since trade ids are sequential.
-- **Cross-validation**: while `depth` is synced, its best bid/ask is compared
-  against `book_ticker`'s latest reading and, when the `depth20` stream is
-  also running, against Binance's own top-20 snapshot. Any mismatch beyond
-  floating point noise is logged as a `validation` event.
-- **Clock offset**: every 5 minutes, the `GLOBAL` events stream records the
+  read instead of grepping logs. Trade id gaps (spot `trade` and futures
+  `futures_agg_trade`) are also detected and logged the instant they happen,
+  since both ids are sequential. A `shutdown` event is logged on exit with
+  the reason (`SIGTERM`, `SIGINT` or `task_exited_unexpectedly`), so a gap at
+  the end of a file can be told apart from an actual outage.
+- **Cross-validation** (spot only): `book_ticker` and `depth20` are separate
+  connections, so at any given instant they are virtually never in sync with
+  the locally reconstructed `depth` book — comparing them by wall-clock time
+  would mostly flag normal timing skew as a "mismatch". Instead, each
+  reference carries the order-book update id it is current as of, and it is
+  only compared once that id matches `depth`'s `last_update_id` exactly, i.e.
+  only when they are genuinely the same version of the book. Any mismatch at
+  that point is logged as a `validation` event. `futures_depth` is **not**
+  cross-checked against `book_ticker`/`depth20` — those are spot references,
+  and would permanently "mismatch" a perpetual's price.
+- **Clock offset**: every 5 minutes, the `_GLOBAL` events stream records the
   difference between Binance's server clock (`/api/v3/time`) and the local
   clock, so latency figures computed from `local_receive_time` can be
   corrected for drift. Keep the host's own clock disciplined with
@@ -321,9 +331,14 @@ snapshot fetch instead.
   blocks `ws.recv()` (keeping `local_receive_time` accurate) and can never be
   double-flushed if a task is cancelled mid-write.
 - `Ctrl+C` **and** `SIGTERM` (what `systemctl stop`/Docker/`kill` send) both
-  cancel every task and flush whatever is left in memory before exiting —
+  trigger a shutdown that flushes whatever is left in memory before exiting —
   important for running this as a service, where `SIGTERM` and not
-  `KeyboardInterrupt` is what actually happens.
+  `KeyboardInterrupt` is what actually happens. Shutdown is ordered: producer
+  tasks (streams) are cancelled and flushed first, *then* a `shutdown` event
+  is logged, and only then are the event logger tasks cancelled and flushed.
+  Doing it the other way around would let the event logger exit before a
+  producer's final event (e.g. a gap noticed while it's being torn down) is
+  logged, silently dropping it.
 - Parquet files are written with `zstd` compression and tagged with the
   recorder's git commit hash in their schema metadata, so any file can be
   traced back to the exact code version that produced it.
@@ -370,10 +385,6 @@ sequences rather than live connections.
 
 ## Known limitations
 
-- File names are based on a millisecond timestamp; two flushes within the same
-  millisecond would overwrite each other. This does not happen in practice at
-  the default buffer size, but a counter should be added to the name if the
-  buffer is made very small.
 - Every symbol/stream pair opens its own websocket connection, so the
   connection count is `symbols x streams` (printed at startup). That is fine
   for a handful of symbols; for dozens, combined streams
@@ -386,7 +397,14 @@ sequences rather than live connections.
   should be converted to `float`/`decimal` for analysis.
 - `futures_open_interest` is polled over REST every 30 seconds rather than
   pushed, since Binance has no open-interest websocket stream.
-- Validation (`book_ticker`/`depth20` cross-checks) only runs while `depth`
-  (or `futures_depth`) is selected together with those streams for the same
-  symbol; it logs mismatches as events but does not attempt to correct the
-  local book itself.
+- Validation (`book_ticker`/`depth20` cross-checks) only runs for the spot
+  `depth` book, and only while `depth` is selected together with those
+  streams for the same symbol; it logs mismatches as events but does not
+  attempt to correct the local book itself. `futures_depth` has no
+  equivalent reference stream to validate against.
+- `futures_liquidation` (`<symbol>@forceOrder`) is a **sample, not an
+  exhaustive record**: Binance pushes at most one forced liquidation order
+  per symbol per second on this stream, so if several liquidations happen
+  within the same second only the most recent is seen. Aggregate stats
+  computed from it (e.g. "total liquidation volume") will undercount —
+  treat it as an indicator of liquidation activity, not a full ledger.

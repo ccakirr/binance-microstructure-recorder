@@ -42,7 +42,6 @@ EVENTS_FLUSH_INTERVAL_SECONDS = 10
 BASE_BACKOFF_SECONDS = 3
 MAX_BACKOFF_SECONDS = 60
 SYNC_STALL_TIMEOUT_SECONDS = 30
-VALIDATION_INTERVAL_SECONDS = 1.0
 VALIDATION_TOLERANCE = 1e-8
 OPEN_INTEREST_POLL_SECONDS = 30
 TIME_SYNC_INTERVAL_SECONDS = 5 * 60
@@ -288,8 +287,20 @@ async def run_futures_agg_trade_collector(
         symbol=symbol, buffer_size=buffer_size, data_dir=data_dir
     )
 
+    def parse_and_check(data: dict) -> dict:
+        record = collector.parse_agg_trade(data)
+        gap = collector.check_gap(record["agg_trade_id"])
+
+        if gap:
+            log_event(
+                event_logger, "futures_agg_trade", "agg_trade_id_gap",
+                f"missing {gap} agg trade(s) before id={record['agg_trade_id']}",
+            )
+
+        return record
+
     await run_stream_collector(
-        collector, collector.parse_agg_trade, symbol, "futures_agg_trade", event_logger
+        collector, parse_and_check, symbol, "futures_agg_trade", event_logger
     )
 
 
@@ -368,11 +379,25 @@ async def run_futures_open_interest_collector(
         raise
 
 
-def validate_local_book(depth_collector, refs, event_logger, symbol):
+def validate_local_book(depth_collector, refs, event_logger):
     """
-    Cross-checks the locally reconstructed order book against independent
-    references (bookTicker's best price, Binance's own depth20 snapshot)
-    and logs a validation event on any mismatch beyond floating point noise.
+    Cross-checks the locally reconstructed **spot** order book against
+    independent spot references (bookTicker's best price, Binance's own
+    depth20 snapshot) and logs a validation event on any mismatch beyond
+    floating point noise.
+
+    Only called for the spot depth collector: bookTicker/depth20 are spot
+    streams, so comparing them against the futures book would compare two
+    different instruments and produce a constant, meaningless "mismatch".
+
+    Since book_ticker and depth20 arrive over separate connections, they are
+    virtually never from the exact same instant as the local book. Comparing
+    them whenever they happen to be checked would mostly compare stale
+    snapshots against each other and flag normal timing noise as a mismatch.
+    Instead, each reference carries the order-book update id it was current
+    as of, and it is only compared once that id lines up exactly with the
+    local book's last_update_id, i.e. only when they are genuinely the same
+    version of the book.
     """
 
     if event_logger is None or refs is None:
@@ -380,16 +405,22 @@ def validate_local_book(depth_collector, refs, event_logger, symbol):
 
     local_bid = depth_collector.get_best_bid()
     local_ask = depth_collector.get_best_ask()
+    local_update_id = depth_collector.last_update_id
 
     book_ticker = refs.get("book_ticker")
 
-    if book_ticker is not None and book_ticker.latest is not None:
+    if (
+        book_ticker is not None
+        and book_ticker.latest is not None
+        and book_ticker.latest["update_id"] == local_update_id
+    ):
         if local_bid is not None:
             diff = float(local_bid[0]) - float(book_ticker.latest["best_bid_price"])
             if abs(diff) > VALIDATION_TOLERANCE:
                 log_event(
                     event_logger, "validation", "best_bid_mismatch",
-                    f"local={local_bid[0]} book_ticker={book_ticker.latest['best_bid_price']}",
+                    f"update_id={local_update_id} local={local_bid[0]} "
+                    f"book_ticker={book_ticker.latest['best_bid_price']}",
                 )
 
         if local_ask is not None:
@@ -397,12 +428,17 @@ def validate_local_book(depth_collector, refs, event_logger, symbol):
             if abs(diff) > VALIDATION_TOLERANCE:
                 log_event(
                     event_logger, "validation", "best_ask_mismatch",
-                    f"local={local_ask[0]} book_ticker={book_ticker.latest['best_ask_price']}",
+                    f"update_id={local_update_id} local={local_ask[0]} "
+                    f"book_ticker={book_ticker.latest['best_ask_price']}",
                 )
 
     depth20 = refs.get("depth20")
 
-    if depth20 is not None and depth20.latest is not None:
+    if (
+        depth20 is not None
+        and depth20.latest is not None
+        and depth20.latest["last_update_id"] == local_update_id
+    ):
         ref_bid = depth20.get_best_bid()
         ref_ask = depth20.get_best_ask()
 
@@ -410,14 +446,14 @@ def validate_local_book(depth_collector, refs, event_logger, symbol):
             if abs(float(local_bid[0]) - float(ref_bid[0])) > VALIDATION_TOLERANCE:
                 log_event(
                     event_logger, "validation", "depth20_bid_mismatch",
-                    f"local={local_bid[0]} depth20={ref_bid[0]}",
+                    f"update_id={local_update_id} local={local_bid[0]} depth20={ref_bid[0]}",
                 )
 
         if local_ask is not None and ref_ask is not None:
             if abs(float(local_ask[0]) - float(ref_ask[0])) > VALIDATION_TOLERANCE:
                 log_event(
                     event_logger, "validation", "depth20_ask_mismatch",
-                    f"local={local_ask[0]} depth20={ref_ask[0]}",
+                    f"update_id={local_update_id} local={local_ask[0]} depth20={ref_ask[0]}",
                 )
 
 
@@ -436,7 +472,10 @@ async def run_depth_collector(
     )
 
     if refs is not None:
-        refs["depth"] = collector
+        # Keyed by stream_label (not a shared "depth" key) so the futures
+        # book never gets cross-checked against spot's bookTicker/depth20 --
+        # they are different instruments and would "mismatch" permanently.
+        refs[stream_label] = collector
 
     snapshot_writer = SnapshotWriter(
         symbol=symbol, data_dir=data_dir, market=market
@@ -447,7 +486,6 @@ async def run_depth_collector(
 
     attempt = 0
     pending_writes = []
-    last_validate_time = 0.0
 
     def maybe_flush_depth():
         if collector.should_flush_by_time(FLUSH_INTERVAL_SECONDS):
@@ -577,17 +615,12 @@ async def run_depth_collector(
                                     log_event(event_logger, stream_label, "sequence_gap")
                                     break
 
-                                now = time.time()
-
                                 if snapshot_writer.should_capture():
                                     snapshot_writer.capture(collector)
                                     maybe_flush_snapshot()
 
-                                if (now - last_validate_time) >= VALIDATION_INTERVAL_SECONDS:
-                                    last_validate_time = now
-                                    validate_local_book(
-                                        collector, refs, event_logger, symbol
-                                    )
+                                if market == "spot":
+                                    validate_local_book(collector, refs, event_logger)
 
                             resyncing = True
 
@@ -628,21 +661,24 @@ async def run_futures_depth_collector(
 
 
 async def run_event_logger_task(event_logger: EventLogger):
+    """
+    Periodically flushes an EventLogger. The buffer swap (take_batch) happens
+    on the event loop, same as schedule_flush() for the regular streams, so a
+    log() call from another task can never land in between the swap and the
+    write and get silently dropped.
+    """
+
     try:
         while True:
             await asyncio.sleep(EVENTS_FLUSH_INTERVAL_SECONDS)
 
-            if (
-                event_logger.buffer
-                and (
-                    len(event_logger.buffer) >= event_logger.buffer_size
-                    or event_logger.should_flush_by_time(EVENTS_FLUSH_INTERVAL_SECONDS)
-                )
-            ):
-                await asyncio.to_thread(event_logger.flush_buffer)
+            if event_logger.buffer:
+                batch = event_logger.take_batch()
+                await asyncio.to_thread(event_logger.flush_buffer, batch)
 
     except asyncio.CancelledError:
-        await asyncio.to_thread(event_logger.flush_buffer)
+        batch = event_logger.take_batch()
+        await asyncio.to_thread(event_logger.flush_buffer, batch)
         raise
 
 
@@ -754,11 +790,19 @@ async def main():
     event_loggers = {
         symbol: EventLogger(symbol=symbol, data_dir=data_dir) for symbol in symbols
     }
-    global_event_logger = EventLogger(symbol="GLOBAL", data_dir=data_dir)
+    # Same "_GLOBAL" pseudo-symbol as ExchangeInfoRecorder, so all
+    # cross-symbol data lands under one consistently named folder.
+    global_event_logger = EventLogger(symbol="_GLOBAL", data_dir=data_dir)
+    all_event_loggers = [*event_loggers.values(), global_event_logger]
 
     refs = {symbol: {} for symbol in symbols}
 
-    tasks = [
+    # Producers: everything that can call log_event(). Shut these down (and
+    # let them flush their own data) *before* touching the event logger
+    # tasks below, otherwise a producer's final event -- e.g. a gap detected
+    # while it's being cancelled -- could be logged after its event logger
+    # already flushed and exited, and be lost.
+    producer_tasks = [
         asyncio.create_task(
             STREAM_RUNNERS[stream](
                 symbol,
@@ -772,30 +816,34 @@ async def main():
         for symbol in symbols
         for stream in streams
     ]
-
-    tasks += [
-        asyncio.create_task(
-            run_event_logger_task(event_loggers[symbol]), name=f"{symbol}:events"
-        )
-        for symbol in symbols
-    ]
-
-    tasks.append(
-        asyncio.create_task(run_event_logger_task(global_event_logger), name="global:events")
-    )
-    tasks.append(
+    producer_tasks.append(
         asyncio.create_task(run_time_sync_task(global_event_logger), name="global:time_sync")
     )
-    tasks.append(
+    producer_tasks.append(
         asyncio.create_task(
             run_exchange_info_task(symbols, data_dir), name="global:exchange_info"
         )
     )
 
+    event_logger_tasks = [
+        asyncio.create_task(
+            run_event_logger_task(event_loggers[symbol]), name=f"{symbol}:events"
+        )
+        for symbol in symbols
+    ]
+    event_logger_tasks.append(
+        asyncio.create_task(run_event_logger_task(global_event_logger), name="global:events")
+    )
+
+    all_tasks = producer_tasks + event_logger_tasks
+
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
+    stop_reason = "unknown"
 
     def _request_stop(sig_name: str):
+        nonlocal stop_reason
+        stop_reason = sig_name
         logger.info("Received %s, shutting down...", sig_name)
         stop_event.set()
 
@@ -809,18 +857,30 @@ async def main():
     stopper = asyncio.create_task(stop_event.wait())
 
     try:
-        await asyncio.wait(
-            [stopper, *tasks], return_when=asyncio.FIRST_COMPLETED
+        done, _ = await asyncio.wait(
+            [stopper, *all_tasks], return_when=asyncio.FIRST_COMPLETED
         )
+
+        if stopper not in done:
+            # A task finished (crashed or returned) on its own, not via a
+            # signal -- record that distinction instead of mislabeling it.
+            stop_reason = "task_exited_unexpectedly"
 
     finally:
         stopper.cancel()
 
-        for task in tasks:
+        for task in producer_tasks:
             if not task.done():
                 task.cancel()
+        await asyncio.gather(*producer_tasks, return_exceptions=True)
 
-        await asyncio.gather(*tasks, stopper, return_exceptions=True)
+        for logger_ in all_event_loggers:
+            log_event(logger_, "recorder", "shutdown", stop_reason)
+
+        for task in event_logger_tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*event_logger_tasks, stopper, return_exceptions=True)
 
 
 if __name__ == "__main__":

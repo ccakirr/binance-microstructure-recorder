@@ -14,7 +14,7 @@ class EventLogger(BaseCollector):
 
     def __init__(
         self,
-        symbol: str = "GLOBAL",
+        symbol: str = "_GLOBAL",
         buffer_size: int = 200,
         data_dir: Path = None,
     ):

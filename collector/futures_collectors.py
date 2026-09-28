@@ -32,6 +32,28 @@ class FuturesAggTradeCollector(BaseCollector):
 
         self.ws_url = f"{FUTURES_WS_BASE}/{self.symbol}@aggTrade"
 
+        # Used to detect gaps in the aggregated trade id sequence.
+        self.last_agg_trade_id = None
+
+    def check_gap(self, agg_trade_id: int) -> int:
+        """
+        Aggregated trade ids are sequential, so a gap is detected the
+        instant a message is skipped. Returns the number of missing ids (0
+        if none / unknown).
+        """
+
+        gap = 0
+
+        if (
+            self.last_agg_trade_id is not None
+            and agg_trade_id > self.last_agg_trade_id + 1
+        ):
+            gap = agg_trade_id - self.last_agg_trade_id - 1
+
+        self.last_agg_trade_id = agg_trade_id
+
+        return gap
+
     def parse_agg_trade(self, data: dict) -> dict:
         return {
             "symbol": data["s"],

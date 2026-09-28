@@ -1,5 +1,10 @@
 import subprocess
 from functools import lru_cache
+from pathlib import Path
+
+# The repo root, regardless of the process's current working directory (a
+# systemd unit, for example, is free to set WorkingDirectory to anything).
+_REPO_DIR = Path(__file__).resolve().parent.parent
 
 
 @lru_cache(maxsize=1)
@@ -18,6 +23,7 @@ def get_git_commit() -> str:
             text=True,
             timeout=2,
             check=True,
+            cwd=_REPO_DIR,
         )
         return result.stdout.strip() or "unknown"
     except Exception:
