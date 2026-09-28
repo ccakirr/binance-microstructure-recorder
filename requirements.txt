@@ -2,3 +2,4 @@ websockets
 pandas
 pyarrow
 aiohttp
+sortedcontainers

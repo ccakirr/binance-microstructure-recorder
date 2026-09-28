@@ -6,8 +6,11 @@ PYTHON := $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
 SYMBOL ?= xrpusdt
 STREAMS ?= depth trade book_ticker
 BUFFER ?= 5000
+DATA_DIR ?=
 
-TARGETS := help install run depth trades book stats clean clean-data
+TARGETS := help install run depth trades book futures test stats clean clean-data
+
+DATA_DIR_FLAG := $(if $(DATA_DIR),--data-dir $(DATA_DIR),)
 
 # Accept lowercase symbol= / streams= / buffer= as well
 ifneq ($(symbol),)
@@ -64,18 +67,26 @@ install: ## Create .venv and install dependencies
 	python3 -m venv .venv
 	.venv/bin/pip install --upgrade pip
 	.venv/bin/pip install -r requirements.txt
+	.venv/bin/pip install pytest
 
 run: ## Record all selected streams
-	$(PYTHON) main.py --symbol $(SYMBOL) --streams $(STREAMS) --buffer-size $(BUFFER)
+	$(PYTHON) main.py --symbol $(SYMBOL) --streams $(STREAMS) --buffer-size $(BUFFER) $(DATA_DIR_FLAG)
 
 depth: ## Record the order book depth stream only
-	$(PYTHON) main.py --symbol $(SYMBOL) --streams depth --buffer-size $(BUFFER)
+	$(PYTHON) main.py --symbol $(SYMBOL) --streams depth --buffer-size $(BUFFER) $(DATA_DIR_FLAG)
 
 trades: ## Record the trade stream only
-	$(PYTHON) main.py --symbol $(SYMBOL) --streams trade --buffer-size $(BUFFER)
+	$(PYTHON) main.py --symbol $(SYMBOL) --streams trade --buffer-size $(BUFFER) $(DATA_DIR_FLAG)
 
 book: ## Record the bookTicker stream only
-	$(PYTHON) main.py --symbol $(SYMBOL) --streams book_ticker --buffer-size $(BUFFER)
+	$(PYTHON) main.py --symbol $(SYMBOL) --streams book_ticker --buffer-size $(BUFFER) $(DATA_DIR_FLAG)
+
+futures: ## Record all futures streams (depth, agg_trade, mark_price, liquidation, open_interest)
+	$(PYTHON) main.py --symbol $(SYMBOL) --buffer-size $(BUFFER) $(DATA_DIR_FLAG) \
+		--streams futures_depth futures_agg_trade futures_mark_price futures_liquidation futures_open_interest
+
+test: ## Run the test suite
+	$(PYTHON) -m pytest tests/ -v
 
 stats: ## Summarize recorded data (file count / size)
 	@if [ ! -d data ]; then \

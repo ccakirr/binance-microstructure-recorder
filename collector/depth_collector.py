@@ -2,44 +2,53 @@ import time
 from pathlib import Path
 
 import aiohttp
-import pandas as pd
+from sortedcontainers import SortedDict
+
+from collector.base_collector import BaseCollector
 
 
-class DepthCollector:
-    def __init__(self, symbol: str = "xrpusdt", buffer_size: int = 5000):
-        self.symbol = symbol.lower()
-        self.buffer_size = buffer_size
-
-        self.buffer = []
+class DepthCollector(BaseCollector):
+    def __init__(
+        self,
+        symbol: str = "xrpusdt",
+        buffer_size: int = 5000,
+        data_dir: Path = None,
+        market: str = "spot",
+    ):
+        super().__init__(
+            symbol=symbol,
+            stream_name="depth",
+            buffer_size=buffer_size,
+            data_dir=data_dir,
+            market=market,
+        )
 
         self.pending_updates = []
+        self.sync_started_at = None
 
-        self.ws_url = (
-            f"wss://stream.binance.com:9443/ws/"
-            f"{self.symbol}@depth@100ms"
-        )
+        if market == "spot":
+            self.ws_url = (
+                f"wss://stream.binance.com:9443/ws/{self.symbol}@depth@100ms"
+            )
+            self.snapshot_url = (
+                "https://data-api.binance.vision/api/v3/depth"
+                f"?symbol={self.symbol.upper()}&limit=5000"
+            )
+        else:
+            self.ws_url = f"wss://fstream.binance.com/ws/{self.symbol}@depth@100ms"
+            self.snapshot_url = (
+                "https://fapi.binance.com/fapi/v1/depth"
+                f"?symbol={self.symbol.upper()}&limit=1000"
+            )
 
-        self.snapshot_url = (
-            "https://data-api.binance.vision/api/v3/depth"
-            f"?symbol={self.symbol.upper()}&limit=5000"
-        )
-
-        self.data_path = (
-            Path.cwd()
-            / "data"
-            / "raw"
-            / self.symbol.upper()
-            / "depth"
-        )
-
-        # Local order book state
+        # Local order book state. Keyed by float(price) so best bid/ask and
+        # top-N snapshots are O(log n) / O(k) instead of scanning every
+        # level on every call; the value keeps the original price string so
+        # precision/formatting from the exchange is never lost.
         self.last_update_id = None
-        self.local_bids = {}
-        self.local_asks = {}
+        self.local_bids = SortedDict()
+        self.local_asks = SortedDict()
         self.is_synced = False
-
-    def ensure_data_path(self):
-        self.data_path.mkdir(parents=True, exist_ok=True)
 
     def parse_depth(self, data: dict) -> dict:
         return {
@@ -47,29 +56,13 @@ class DepthCollector:
             "event_time": data["E"],
             "first_update_id": data["U"],
             "final_update_id": data["u"],
+            # Only present on futures diff events; used instead of U/u for
+            # continuity checks there (see _is_update_continuous).
+            "previous_update_id": data.get("pu"),
             "bids": data["b"],
             "asks": data["a"],
             "local_receive_time": int(time.time() * 1000),
         }
-
-    def add_to_buffer(self, depth: dict) -> bool:
-        self.buffer.append(depth)
-        return len(self.buffer) >= self.buffer_size
-
-    def flush_buffer(self):
-        if not self.buffer:
-            return
-
-        df = pd.DataFrame(self.buffer)
-
-        self.ensure_data_path()
-
-        filename = f"depth_{int(time.time() * 1000)}.parquet"
-        file_path = self.data_path / filename
-
-        df.to_parquet(file_path, index=False)
-
-        self.buffer.clear()
 
     async def fetch_snapshot(self, session: aiohttp.ClientSession) -> dict:
         async with session.get(self.snapshot_url) as response:
@@ -81,27 +74,43 @@ class DepthCollector:
     def load_snapshot(self, snapshot: dict):
         self.last_update_id = snapshot["lastUpdateId"]
 
-        self.local_bids = {
-            price: quantity
+        self.local_bids = SortedDict(
+            (float(price), (price, quantity))
             for price, quantity in snapshot["bids"]
-        }
+        )
 
-        self.local_asks = {
-            price: quantity
+        self.local_asks = SortedDict(
+            (float(price), (price, quantity))
             for price, quantity in snapshot["asks"]
-        }
+        )
 
         self.is_synced = False
+        self.sync_started_at = time.time()
+
+    def is_sync_stalled(self, timeout_seconds: float = 30.0) -> bool:
+        """
+        True if we have been waiting for a matching update for longer than
+        timeout_seconds. Per Binance's docs, if the snapshot's lastUpdateId
+        is older than the buffered updates by that much, the snapshot is
+        stale and should be refetched instead of waited on forever.
+        """
+
+        if self.sync_started_at is None:
+            return False
+
+        return (time.time() - self.sync_started_at) >= timeout_seconds
 
     def buffer_pending_update(self, depth: dict):
         self.pending_updates.append(depth)
 
-    def apply_side_updates(self, book: dict, updates: list):
+    def apply_side_updates(self, book: SortedDict, updates: list):
         for price, quantity in updates:
+            key = float(price)
+
             if float(quantity) == 0:
-                book.pop(price, None)
+                book.pop(key, None)
             else:
-                book[price] = quantity
+                book[key] = (price, quantity)
 
     def apply_depth_update(self, depth: dict):
         self.apply_side_updates(
@@ -120,17 +129,32 @@ class DepthCollector:
         if self.last_update_id is None:
             return
 
-        self.pending_updates = [
-            update
-            for update in self.pending_updates
-            if update["final_update_id"] > self.last_update_id
-        ]
+        if self.market == "futures":
+            # Binance's futures docs: drop events with u < lastUpdateId.
+            self.pending_updates = [
+                update
+                for update in self.pending_updates
+                if update["final_update_id"] >= self.last_update_id
+            ]
+        else:
+            # Spot docs: drop events with u <= lastUpdateId.
+            self.pending_updates = [
+                update
+                for update in self.pending_updates
+                if update["final_update_id"] > self.last_update_id
+            ]
 
     def find_first_sync_update_index(self):
         if self.last_update_id is None:
             return None
 
-        expected_update_id = self.last_update_id + 1
+        # Spot: first event must satisfy U <= lastUpdateId+1 <= u.
+        # Futures: first event must satisfy U <= lastUpdateId <= u (no +1).
+        expected_update_id = (
+            self.last_update_id
+            if self.market == "futures"
+            else self.last_update_id + 1
+        )
 
         for index, update in enumerate(self.pending_updates):
             first_id = update["first_update_id"]
@@ -157,8 +181,12 @@ class DepthCollector:
 
         self.pending_updates = self.pending_updates[first_sync_index:]
 
-        for update in self.pending_updates:
-            if not self._is_update_continuous(update):
+        for index, update in enumerate(self.pending_updates):
+            # The first applied update was already validated against the
+            # snapshot by find_first_sync_update_index (U/u vs lastUpdateId).
+            # On futures its "pu" chains to the *previous stream event*, not
+            # to the snapshot, so it must not be continuity-checked here.
+            if index > 0 and not self._is_update_continuous(update):
                 self.invalidate_sync()
                 return False
 
@@ -172,6 +200,10 @@ class DepthCollector:
     def _is_update_continuous(self, depth: dict) -> bool:
         if self.last_update_id is None:
             return False
+
+        if self.market == "futures":
+            # Futures docs: each event's pu must equal the previous event's u.
+            return depth.get("previous_update_id") == self.last_update_id
 
         expected_id = self.last_update_id + 1
 
@@ -209,6 +241,7 @@ class DepthCollector:
     def invalidate_sync(self):
         self.is_synced = False
         self.last_update_id = None
+        self.sync_started_at = None
 
         self.local_bids.clear()
         self.local_asks.clear()
@@ -219,23 +252,24 @@ class DepthCollector:
         if not self.local_bids:
             return None
 
-        price = max(
-            self.local_bids.keys(),
-            key=float,
-        )
-
-        return price, self.local_bids[price]
+        # Ascending order, so the highest price (best bid) is last.
+        return self.local_bids.peekitem(-1)[1]
 
     def get_best_ask(self):
         if not self.local_asks:
             return None
 
-        price = min(
-            self.local_asks.keys(),
-            key=float,
-        )
+        # Ascending order, so the lowest price (best ask) is first.
+        return self.local_asks.peekitem(0)[1]
 
-        return price, self.local_asks[price]
+    def get_top_bids(self, n: int = 20):
+        if not self.local_bids:
+            return []
+
+        return [value for _, value in reversed(self.local_bids.items()[-n:])]
+
+    def get_top_asks(self, n: int = 20):
+        return [value for _, value in self.local_asks.items()[:n]]
 
     def get_spread(self):
         best_bid = self.get_best_bid()

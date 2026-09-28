@@ -1,16 +1,31 @@
 # Crypto Market Data Recorder
 
-An asynchronous recorder that listens to live Binance spot market data over
-websockets and stores it on disk as **parquet**.
+An asynchronous recorder that listens to live Binance spot and perpetual
+futures market data over websockets and stores it on disk as **parquet**.
 
-Three streams are collected concurrently and independently of each other,
-for one or more symbols at a time:
+Every stream is collected concurrently and independently of the others, for
+one or more symbols at a time:
 
-| Stream | Binance channel | What it records |
-| --- | --- | --- |
-| `trade` | `<symbol>@trade` | Every executed trade (tick data) |
-| `book_ticker` | `<symbol>@bookTicker` | Best bid/ask price and quantity, on every change |
-| `depth` | `<symbol>@depth@100ms` | Order book diff updates (100 ms) + local order book |
+| Stream | Market | Binance channel | What it records |
+| --- | --- | --- | --- |
+| `trade` | spot | `<symbol>@trade` | Every executed trade (tick data) |
+| `book_ticker` | spot | `<symbol>@bookTicker` | Best bid/ask price and quantity, on every change |
+| `depth` | spot | `<symbol>@depth@100ms` | Order book diff updates (100 ms) + local order book |
+| `depth20` | spot | `<symbol>@depth20@100ms` | Binance's own top-20 book, as a reference to validate `depth`'s reconstructed book against |
+| `futures_depth` | futures | `<symbol>@depth@100ms` | Same as `depth`, for the perpetual, using futures' `pu`-based sync rules |
+| `futures_agg_trade` | futures | `<symbol>@aggTrade` | Aggregated perp trades |
+| `futures_mark_price` | futures | `<symbol>@markPrice@1s` | Mark price, index price, funding rate |
+| `futures_liquidation` | futures | `<symbol>@forceOrder` | Forced liquidation orders |
+| `futures_open_interest` | futures | REST poll, `/fapi/v1/openInterest` | Open interest (no push stream exists) |
+
+`depth` and `futures_depth` also write two side files per symbol: a
+per-second top-20 **snapshot** of the reconstructed book (`snapshots/`), and
+an **events** log (`events/`) recording connects, disconnects, resyncs,
+sequence gaps and cross-checks against `book_ticker`/`depth20`. A `GLOBAL`
+events stream additionally records periodic clock-offset checks against
+Binance's server time, and `exchange_info/` stores a daily snapshot of tick
+size / lot size / trading status for the tracked symbols. Every parquet file
+carries the recorder's git commit hash in its metadata.
 
 ## Installation
 
@@ -27,25 +42,30 @@ pip install -r requirements.txt
 ```
 
 Requirements: Python 3.10+ (developed on 3.13), `websockets`, `pandas`,
-`pyarrow`, `aiohttp`.
+`pyarrow`, `aiohttp`, `sortedcontainers`.
 
 ## Usage
 
 ```bash
-make run                             # all three streams, default symbol (XRPUSDT)
+make run                             # depth, trade, book_ticker, default symbol (XRPUSDT)
 make run btcusdt                     # different symbol
 make run btcusdt ethusdt bnbusdt     # several symbols at once
 make run btcusdt STREAMS="trade depth"   # only selected streams
 make run btcusdt BUFFER=1000         # more frequent parquet writes
 make trades ethusdt                  # a single stream
+make futures btcusdt                 # all futures streams for one symbol
+make run btcusdt DATA_DIR=/mnt/data  # write under a custom directory
+make test                            # run the test suite
 ```
 
 Symbols can be written bare after the target, as above, or passed as a
 variable — `make run SYMBOL="btcusdt ethusdt"`. Both forms end up as
 `--symbol btcusdt ethusdt`.
 
-Stop with `Ctrl+C`. Records still sitting in the buffer are written to disk on
-shutdown, so a partially filled buffer is not lost.
+Stop with `Ctrl+C` or by sending `SIGTERM` (e.g. `systemctl stop`, `kill`,
+Docker's default stop signal) — both are handled the same way: every task is
+cancelled and whatever is still sitting in memory (buffers, event logs,
+pending snapshots) is flushed to disk before the process exits.
 
 A run looks like this:
 
@@ -123,29 +143,39 @@ python main.py --buffer-size 1000
 | Argument | Default | Description |
 | --- | --- | --- |
 | `--symbol` | `xrpusdt` | One or more Binance trading pairs. Case insensitive, duplicates ignored. |
-| `--streams` | `depth trade book_ticker` | Streams to record. One or several. |
-| `--buffer-size` | `5000` | Number of records kept in memory before writing one parquet file. |
+| `--streams` | `depth trade book_ticker` | Streams to record. See the table above for all spot/futures choices. |
+| `--buffer-size` | `5000` | Number of records kept in memory before writing one parquet file (also capped at 60s, see Resilience). |
+| `--data-dir` | current directory | Directory `data/...` is created under. |
 
 ## Output layout
 
-The directories (including `data/raw`) are created at startup, so there is
-nothing to set up by hand:
+The directories are created at startup, so there is nothing to set up by
+hand. Spot streams live under `data/raw`, futures streams under
+`data/raw_futures`, keeping the two markets clearly apart:
 
 ```
 data/
-└── raw/
-    ├── XRPUSDT/
-    │   ├── trades/       trades_<ms>.parquet
-    │   ├── book_ticker/  book_ticker_<ms>.parquet
-    │   └── depth/        depth_<ms>.parquet
+├── raw/
+│   ├── XRPUSDT/
+│   │   ├── trades/       trades_<ms>.parquet
+│   │   ├── book_ticker/  book_ticker_<ms>.parquet
+│   │   ├── depth/        depth_<ms>.parquet
+│   │   ├── depth20/      depth20_<ms>.parquet
+│   │   ├── snapshots/    snapshots_<ms>.parquet   (top-20 of the local book, 1/s)
+│   │   └── events/       events_<ms>.parquet      (connects, gaps, resyncs, validation)
+│   ├── GLOBAL/events/                              (clock offset checks)
+│   └── _GLOBAL/exchange_info/                      (daily tick/lot size snapshot)
+└── raw_futures/
     └── BTCUSDT/
-        └── ...
+        ├── depth/  agg_trades/  mark_price/  liquidations/  open_interest/
+        ├── snapshots/
+        └── events/
 ```
 
 `<ms>` in the file name is the epoch millisecond of the flush.
 
-> The path is based on `Path.cwd()`, so `data/` is created **in the directory
-> you run the command from**. Running from the project root is cleanest.
+> The path defaults to `Path.cwd()`; use `--data-dir` (or `make ... DATA_DIR=`)
+> to point it somewhere else, e.g. a mounted data disk.
 
 ### Parquet schemas
 
@@ -238,37 +268,105 @@ Raw diff updates keep being written to parquet regardless of sync state, so no
 data is lost while recording.
 
 Once synchronized, the live book can be inspected with `get_best_bid()`,
-`get_best_ask()` and `get_spread()`.
+`get_best_ask()`, `get_top_bids()` / `get_top_asks()` and `get_spread()` —
+backed by a `sortedcontainers.SortedDict` so these are O(log n) / O(k) instead
+of scanning every price level.
+
+**Futures uses a different continuity rule.** Binance's futures diff depth
+events carry a `pu` field (the previous event's `u`) instead of chaining
+`U`/`u` the way spot does, and the first synced event only needs
+`U <= lastUpdateId <= u` (no `+1`). `DepthCollector(market="futures")`
+switches to this rule automatically; mixing up the two causes the book to
+falsely detect a gap and resync on almost every single update, which is
+exactly what an earlier version of this recorder did.
+
+If a snapshot turns out to be older than every buffered update — so no update
+will ever straddle `lastUpdateId + 1` — the sync would otherwise wait forever.
+`is_sync_stalled()` detects this after 30 seconds and triggers a fresh
+snapshot fetch instead.
+
+## Data quality: snapshots, events and cross-checks
+
+- **Snapshots** (`snapshots/`): once a second, the top 20 levels of the
+  synced local book are captured independently of the raw diff stream — a
+  cheap, directly-readable reference for research.
+- **Events** (`events/`, per symbol, plus a `GLOBAL` stream): every connect,
+  disconnect, resync, sequence gap and validation mismatch is recorded with a
+  timestamp, so a `check_data_quality`-style script has structured data to
+  read instead of grepping logs. Trade id gaps are also detected and logged
+  the instant they happen, since trade ids are sequential.
+- **Cross-validation**: while `depth` is synced, its best bid/ask is compared
+  against `book_ticker`'s latest reading and, when the `depth20` stream is
+  also running, against Binance's own top-20 snapshot. Any mismatch beyond
+  floating point noise is logged as a `validation` event.
+- **Clock offset**: every 5 minutes, the `GLOBAL` events stream records the
+  difference between Binance's server clock (`/api/v3/time`) and the local
+  clock, so latency figures computed from `local_receive_time` can be
+  corrected for drift. Keep the host's own clock disciplined with
+  chrony/ntpd — this only measures what's left over.
+- **Exchange metadata**: `exchange_info/` stores tick size, lot size and
+  trading status for the tracked symbols once a day, so a filter change
+  doesn't silently invalidate downstream analysis.
 
 ## Resilience
 
 - Every symbol/stream pair runs in its own connection loop; if one drops the
-  others are unaffected and the dropped one reconnects after 3 seconds. Each
-  symbol keeps its own order book, buffers and output directory.
-- The buffer is flushed to disk before reconnecting and on shutdown.
-- Parquet writes run in a worker thread (`asyncio.to_thread`), so a flush on
-  one stream does not stall `ws.recv()` — and therefore `local_receive_time` —
-  on the others. The shutdown flush stays synchronous on purpose, so it cannot
-  be interrupted by the cancellation that triggered it.
-- `Ctrl+C` cancels all tasks cleanly.
+  others are unaffected and the dropped one reconnects after a jittered
+  exponential backoff (3s up to 60s). Each symbol keeps its own order book,
+  buffers and output directory.
+- Buffers are flushed by size (`--buffer-size`) **or** time — at least once a
+  minute — so a quiet symbol/stream doesn't sit on unflushed data for hours.
+- A buffer flush swaps the in-memory list out (`take_batch()`) and writes the
+  swapped-out batch in a background thread (`asyncio.to_thread`), so it never
+  blocks `ws.recv()` (keeping `local_receive_time` accurate) and can never be
+  double-flushed if a task is cancelled mid-write.
+- `Ctrl+C` **and** `SIGTERM` (what `systemctl stop`/Docker/`kill` send) both
+  cancel every task and flush whatever is left in memory before exiting —
+  important for running this as a service, where `SIGTERM` and not
+  `KeyboardInterrupt` is what actually happens.
+- Parquet files are written with `zstd` compression and tagged with the
+  recorder's git commit hash in their schema metadata, so any file can be
+  traced back to the exact code version that produced it.
 
 ## Project layout
 
 ```
 main.py                              CLI, stream tasks, reconnect loops
 collector/
-├── trade_collector.py               TradeCollector
+├── base_collector.py                BaseCollector: buffer/flush/parquet, shared by everything below
+├── version.py                       git_commit() helper, tagged onto every parquet file
+├── trade_collector.py               TradeCollector (spot trades)
 ├── book_ticker_collector.py         BookTickerCollector
-└── depth_collector.py               DepthCollector + local order book
+├── depth_collector.py               DepthCollector + local order book (spot & futures)
+├── depth20_collector.py             Depth20Collector (Binance's own top-20 book)
+├── futures_collectors.py            FuturesAggTrade/MarkPrice/Liquidation/OpenInterestCollector
+├── snapshot_writer.py                SnapshotWriter (periodic top-N book capture)
+├── event_logger.py                  EventLogger (connect/gap/resync/validation events)
+├── exchange_info_recorder.py        ExchangeInfoRecorder (daily tick/lot size snapshot)
+└── time_sync.py                     measure_clock_offset() against Binance's server time
+tests/                                pytest suite (mainly DepthCollector's sync logic)
 Makefile                             shortcuts for the commands above
 requirements.txt
 README.md
 ```
 
-Every collector shares the same interface: `ws_url`, `data_path`,
-`ensure_data_path()`, `parse_*()`, `add_to_buffer()`, `flush_buffer()`.
-To add a new stream, write a class with that interface and register it in the
-`STREAM_RUNNERS` dictionary in `main.py`.
+Every collector extends `BaseCollector`, which owns `data_path`,
+`ensure_data_path()`, `add_to_buffer()`, `take_batch()`, `should_flush_by_time()`
+and `flush_buffer()`. A subclass only needs to set `self.ws_url` and add a
+`parse_*()` method. To add a new stream: write such a class and register a
+runner for it in the `STREAM_RUNNERS` dictionary in `main.py`.
+
+## Tests
+
+```bash
+make test
+# or: pytest tests/ -v
+```
+
+`DepthCollector`'s synchronization logic (normal sync, sequence gaps, stale
+snapshots, the spot vs. futures continuity rules, best bid/ask/top-N queries)
+is pure Python with no network calls, so it is covered with synthetic update
+sequences rather than live connections.
 
 ## Known limitations
 
@@ -280,8 +378,15 @@ To add a new stream, write a class with that interface and register it in the
   connection count is `symbols x streams` (printed at startup). That is fine
   for a handful of symbols; for dozens, combined streams
   (`/stream?streams=...`) would be the way to go.
-- Each depth resync fetches a REST snapshot, which costs 250 request weight at
-  `limit=5000` against Binance's 6000/minute IP budget — worth keeping in mind
-  when recording depth for many symbols at once.
+- Each depth resync fetches a REST snapshot, which costs request weight
+  against Binance's IP budget (250 at `limit=5000` for spot, less for
+  futures) — worth keeping in mind when recording depth for many symbols at
+  once.
 - Prices and quantities are stored as strings (to avoid precision loss) and
   should be converted to `float`/`decimal` for analysis.
+- `futures_open_interest` is polled over REST every 30 seconds rather than
+  pushed, since Binance has no open-interest websocket stream.
+- Validation (`book_ticker`/`depth20` cross-checks) only runs while `depth`
+  (or `futures_depth`) is selected together with those streams for the same
+  symbol; it logs mismatches as events but does not attempt to correct the
+  local book itself.

@@ -1,15 +1,58 @@
 import argparse
 import asyncio
 import json
+import logging
+import random
+import signal
+import time
+from pathlib import Path
 
 import aiohttp
 import websockets
 
 from collector.book_ticker_collector import BookTickerCollector
 from collector.depth_collector import DepthCollector
+from collector.depth20_collector import Depth20Collector
+from collector.event_logger import EventLogger
+from collector.exchange_info_recorder import ExchangeInfoRecorder
+from collector.futures_collectors import (
+    FuturesAggTradeCollector,
+    FuturesLiquidationCollector,
+    FuturesMarkPriceCollector,
+    FuturesOpenInterestCollector,
+)
+from collector.snapshot_writer import SnapshotWriter
+from collector.time_sync import measure_clock_offset
 from collector.trade_collector import TradeCollector
 
-STREAM_CHOICES = ("depth", "trade", "book_ticker")
+SPOT_STREAM_CHOICES = ("depth", "trade", "book_ticker", "depth20")
+FUTURES_STREAM_CHOICES = (
+    "futures_depth",
+    "futures_agg_trade",
+    "futures_mark_price",
+    "futures_liquidation",
+    "futures_open_interest",
+)
+STREAM_CHOICES = SPOT_STREAM_CHOICES + FUTURES_STREAM_CHOICES
+DEFAULT_STREAMS = ("depth", "trade", "book_ticker")
+
+RECEIVE_TIMEOUT_SECONDS = 1.0
+FLUSH_INTERVAL_SECONDS = 60
+EVENTS_FLUSH_INTERVAL_SECONDS = 10
+BASE_BACKOFF_SECONDS = 3
+MAX_BACKOFF_SECONDS = 60
+SYNC_STALL_TIMEOUT_SECONDS = 30
+VALIDATION_INTERVAL_SECONDS = 1.0
+VALIDATION_TOLERANCE = 1e-8
+OPEN_INTEREST_POLL_SECONDS = 30
+TIME_SYNC_INTERVAL_SECONDS = 5 * 60
+EXCHANGE_INFO_INTERVAL_SECONDS = 24 * 60 * 60
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger("recorder")
 
 
 def parse_args():
@@ -34,8 +77,12 @@ def parse_args():
         type=str,
         nargs="+",
         choices=STREAM_CHOICES,
-        default=list(STREAM_CHOICES),
-        help="Streams to record, e.g. --streams depth trade",
+        default=list(DEFAULT_STREAMS),
+        help=(
+            "Streams to record. Spot: depth, trade, book_ticker, depth20. "
+            "Futures: futures_depth, futures_agg_trade, futures_mark_price, "
+            "futures_liquidation, futures_open_interest."
+        ),
     )
 
     parser.add_argument(
@@ -46,230 +93,622 @@ def parse_args():
         help="Number of records kept in memory before writing a parquet file",
     )
 
+    parser.add_argument(
+        "--data-dir",
+        "-data-dir",
+        type=str,
+        default=None,
+        help="Directory to write data/... into (defaults to cwd)",
+    )
+
     return parser.parse_args()
 
 
 def prepare_data_path(collector, symbol: str, name: str):
     """
-    Creates the data/raw/<SYMBOL>/<stream> directory the collector writes to,
-    at startup instead of waiting for the first parquet write.
+    Creates the directory a collector writes to at startup instead of
+    waiting for the first parquet write.
     """
 
     collector.ensure_data_path()
 
-    print(
-        f"[{symbol.upper()}] {name} output: {collector.data_path}"
-    )
+    logger.info("[%s] %s output: %s", symbol.upper(), name, collector.data_path)
 
 
-def flush_remaining(collector, symbol: str, name: str):
-    pending = len(collector.buffer)
+def schedule_flush(collector, pending_writes: list, symbol: str, name: str):
+    """
+    Swaps the buffer out and writes it in a background task instead of
+    awaiting it inline, so ws.recv() on this stream is never blocked by a
+    parquet write (and local_receive_time stays accurate).
+    """
 
-    if pending == 0:
+    batch = collector.take_batch()
+    collector.last_flush_time = time.time()
+
+    if not batch:
         return
 
-    collector.flush_buffer()
+    async def _write():
+        await asyncio.to_thread(collector.flush_buffer, batch)
+        logger.info("[%s] Wrote %d %s records.", symbol.upper(), len(batch), name)
 
-    print(
-        f"[{symbol.upper()}] Flushed {pending} pending {name} records."
-    )
+    pending_writes.append(asyncio.create_task(_write()))
+    pending_writes[:] = [t for t in pending_writes if not t.done()]
 
 
-async def run_stream_collector(collector, parse, symbol: str, name: str):
+async def flush_remaining(collector, symbol: str, name: str):
+    batch = collector.take_batch()
+
+    if not batch:
+        return
+
+    await asyncio.to_thread(collector.flush_buffer, batch)
+
+    logger.info("[%s] Flushed %d pending %s records.", symbol.upper(), len(batch), name)
+
+
+async def drain_pending_writes(pending_writes: list):
+    if pending_writes:
+        await asyncio.gather(*pending_writes, return_exceptions=True)
+        pending_writes.clear()
+
+
+def backoff_delay(attempt: int) -> float:
+    delay = min(MAX_BACKOFF_SECONDS, BASE_BACKOFF_SECONDS * (2 ** attempt))
+    return delay * (0.5 + random.random())
+
+
+def log_event(event_logger, stream: str, event_type: str, detail: str = ""):
+    if event_logger is not None:
+        event_logger.log(stream, event_type, detail)
+
+
+async def run_stream_collector(
+    collector, parse, symbol: str, name: str, event_logger=None
+):
     """
     Listens to a single websocket stream (trade, bookTicker, ...), parses each
     incoming message into the buffer and flushes it to a parquet file once the
-    buffer is full.
+    buffer is full or the flush interval elapses.
     """
 
     prepare_data_path(collector, symbol, name)
 
-    while True:
-        try:
-            print(f"[{symbol.upper()}] Connecting to {name} stream...")
+    attempt = 0
+    pending_writes = []
 
-            async with websockets.connect(collector.ws_url) as ws:
-                print(f"[{symbol.upper()}] {name} stream connected.")
+    try:
+        while True:
+            try:
+                logger.info("[%s] Connecting to %s stream...", symbol.upper(), name)
 
-                while True:
-                    message = await ws.recv()
-                    data = json.loads(message)
+                async with websockets.connect(collector.ws_url) as ws:
+                    logger.info("[%s] %s stream connected.", symbol.upper(), name)
+                    log_event(event_logger, name, "connected")
+                    attempt = 0
 
-                    record = parse(data)
+                    while True:
+                        try:
+                            message = await asyncio.wait_for(
+                                ws.recv(), timeout=RECEIVE_TIMEOUT_SECONDS
+                            )
+                        except asyncio.TimeoutError:
+                            if collector.should_flush_by_time(FLUSH_INTERVAL_SECONDS):
+                                schedule_flush(collector, pending_writes, symbol, name)
+                            continue
 
-                    if collector.add_to_buffer(record):
-                        flushed = len(collector.buffer)
+                        data = json.loads(message)
+                        record = parse(data)
 
-                        # Parquet writing is synchronous CPU + disk work.
-                        # Running it in a thread keeps the event loop free,
-                        # so a flush here does not delay ws.recv() (and thus
-                        # local_receive_time) on every other stream.
+                        if (
+                            collector.add_to_buffer(record)
+                            or collector.should_flush_by_time(FLUSH_INTERVAL_SECONDS)
+                        ):
+                            schedule_flush(collector, pending_writes, symbol, name)
+
+            except asyncio.CancelledError:
+                raise
+
+            except Exception as exc:
+                logger.warning(
+                    "[%s] %s connection error: %s: %s",
+                    symbol.upper(), name, type(exc).__name__, exc,
+                )
+                log_event(
+                    event_logger, name, "connection_error",
+                    f"{type(exc).__name__}: {exc}",
+                )
+
+            attempt += 1
+            delay = backoff_delay(attempt)
+            logger.info(
+                "[%s] Reconnecting %s stream in %.1fs...", symbol.upper(), name, delay
+            )
+            await asyncio.sleep(delay)
+
+    except asyncio.CancelledError:
+        await drain_pending_writes(pending_writes)
+        await flush_remaining(collector, symbol, name)
+        raise
+
+    finally:
+        await drain_pending_writes(pending_writes)
+
+
+async def run_trade_collector(
+    symbol: str, buffer_size: int, data_dir: Path, event_logger=None, refs=None
+):
+    collector = TradeCollector(symbol=symbol, buffer_size=buffer_size, data_dir=data_dir)
+
+    def parse_and_check(data: dict) -> dict:
+        record = collector.parse_trade(data)
+        gap = collector.check_gap(record["trade_id"])
+
+        if gap:
+            log_event(
+                event_logger, "trade", "trade_id_gap",
+                f"missing {gap} trade(s) before id={record['trade_id']}",
+            )
+
+        return record
+
+    await run_stream_collector(collector, parse_and_check, symbol, "trade", event_logger)
+
+
+async def run_book_ticker_collector(
+    symbol: str, buffer_size: int, data_dir: Path, event_logger=None, refs=None
+):
+    collector = BookTickerCollector(symbol=symbol, buffer_size=buffer_size, data_dir=data_dir)
+
+    if refs is not None:
+        refs["book_ticker"] = collector
+
+    await run_stream_collector(
+        collector, collector.parse_book_ticker, symbol, "book_ticker", event_logger
+    )
+
+
+async def run_depth20_collector(
+    symbol: str, buffer_size: int, data_dir: Path, event_logger=None, refs=None
+):
+    collector = Depth20Collector(symbol=symbol, buffer_size=buffer_size, data_dir=data_dir)
+
+    if refs is not None:
+        refs["depth20"] = collector
+
+    await run_stream_collector(
+        collector, collector.parse_depth20, symbol, "depth20", event_logger
+    )
+
+
+async def run_futures_agg_trade_collector(
+    symbol: str, buffer_size: int, data_dir: Path, event_logger=None, refs=None
+):
+    collector = FuturesAggTradeCollector(
+        symbol=symbol, buffer_size=buffer_size, data_dir=data_dir
+    )
+
+    await run_stream_collector(
+        collector, collector.parse_agg_trade, symbol, "futures_agg_trade", event_logger
+    )
+
+
+async def run_futures_mark_price_collector(
+    symbol: str, buffer_size: int, data_dir: Path, event_logger=None, refs=None
+):
+    collector = FuturesMarkPriceCollector(
+        symbol=symbol, buffer_size=buffer_size, data_dir=data_dir
+    )
+
+    await run_stream_collector(
+        collector, collector.parse_mark_price, symbol, "futures_mark_price", event_logger
+    )
+
+
+async def run_futures_liquidation_collector(
+    symbol: str, buffer_size: int, data_dir: Path, event_logger=None, refs=None
+):
+    collector = FuturesLiquidationCollector(
+        symbol=symbol, buffer_size=buffer_size, data_dir=data_dir
+    )
+
+    await run_stream_collector(
+        collector, collector.parse_liquidation, symbol, "futures_liquidation", event_logger
+    )
+
+
+async def run_futures_open_interest_collector(
+    symbol: str, buffer_size: int, data_dir: Path, event_logger=None, refs=None
+):
+    """
+    Open interest has no push stream, so it is polled over REST on a fixed
+    interval instead of following the websocket reconnect loop.
+    """
+
+    collector = FuturesOpenInterestCollector(
+        symbol=symbol, buffer_size=buffer_size, data_dir=data_dir
+    )
+
+    prepare_data_path(collector, symbol, "futures_open_interest")
+
+    attempt = 0
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            while True:
+                try:
+                    record = await collector.fetch(session)
+
+                    if (
+                        collector.add_to_buffer(record)
+                        or collector.should_flush_by_time(FLUSH_INTERVAL_SECONDS)
+                    ):
                         await asyncio.to_thread(collector.flush_buffer)
 
-                        print(
-                            f"[{symbol.upper()}] "
-                            f"Wrote {flushed} {name} records."
-                        )
+                    attempt = 0
+                    await asyncio.sleep(OPEN_INTEREST_POLL_SECONDS)
 
-        except asyncio.CancelledError:
-            flush_remaining(collector, symbol, name)
-            raise
+                except asyncio.CancelledError:
+                    raise
 
-        except KeyboardInterrupt:
-            flush_remaining(collector, symbol, name)
-            raise
+                except Exception as exc:
+                    attempt += 1
+                    logger.warning(
+                        "[%s] futures_open_interest poll error: %s: %s",
+                        symbol.upper(), type(exc).__name__, exc,
+                    )
+                    log_event(
+                        event_logger, "futures_open_interest", "poll_error",
+                        f"{type(exc).__name__}: {exc}",
+                    )
+                    await asyncio.sleep(backoff_delay(attempt))
 
-        except Exception as exc:
-            print(
-                f"[{symbol.upper()}] {name} connection error: "
-                f"{type(exc).__name__}: {exc}"
+    except asyncio.CancelledError:
+        await flush_remaining(collector, symbol, "futures_open_interest")
+        raise
+
+
+def validate_local_book(depth_collector, refs, event_logger, symbol):
+    """
+    Cross-checks the locally reconstructed order book against independent
+    references (bookTicker's best price, Binance's own depth20 snapshot)
+    and logs a validation event on any mismatch beyond floating point noise.
+    """
+
+    if event_logger is None or refs is None:
+        return
+
+    local_bid = depth_collector.get_best_bid()
+    local_ask = depth_collector.get_best_ask()
+
+    book_ticker = refs.get("book_ticker")
+
+    if book_ticker is not None and book_ticker.latest is not None:
+        if local_bid is not None:
+            diff = float(local_bid[0]) - float(book_ticker.latest["best_bid_price"])
+            if abs(diff) > VALIDATION_TOLERANCE:
+                log_event(
+                    event_logger, "validation", "best_bid_mismatch",
+                    f"local={local_bid[0]} book_ticker={book_ticker.latest['best_bid_price']}",
+                )
+
+        if local_ask is not None:
+            diff = float(local_ask[0]) - float(book_ticker.latest["best_ask_price"])
+            if abs(diff) > VALIDATION_TOLERANCE:
+                log_event(
+                    event_logger, "validation", "best_ask_mismatch",
+                    f"local={local_ask[0]} book_ticker={book_ticker.latest['best_ask_price']}",
+                )
+
+    depth20 = refs.get("depth20")
+
+    if depth20 is not None and depth20.latest is not None:
+        ref_bid = depth20.get_best_bid()
+        ref_ask = depth20.get_best_ask()
+
+        if local_bid is not None and ref_bid is not None:
+            if abs(float(local_bid[0]) - float(ref_bid[0])) > VALIDATION_TOLERANCE:
+                log_event(
+                    event_logger, "validation", "depth20_bid_mismatch",
+                    f"local={local_bid[0]} depth20={ref_bid[0]}",
+                )
+
+        if local_ask is not None and ref_ask is not None:
+            if abs(float(local_ask[0]) - float(ref_ask[0])) > VALIDATION_TOLERANCE:
+                log_event(
+                    event_logger, "validation", "depth20_ask_mismatch",
+                    f"local={local_ask[0]} depth20={ref_ask[0]}",
+                )
+
+
+async def run_depth_collector(
+    symbol: str,
+    buffer_size: int,
+    data_dir: Path,
+    event_logger=None,
+    refs=None,
+    market: str = "spot",
+):
+    stream_label = "depth" if market == "spot" else "futures_depth"
+
+    collector = DepthCollector(
+        symbol=symbol, buffer_size=buffer_size, data_dir=data_dir, market=market
+    )
+
+    if refs is not None:
+        refs["depth"] = collector
+
+    snapshot_writer = SnapshotWriter(
+        symbol=symbol, data_dir=data_dir, market=market
+    )
+    prepare_data_path(snapshot_writer, symbol, f"{stream_label}_snapshots")
+
+    prepare_data_path(collector, symbol, stream_label)
+
+    attempt = 0
+    pending_writes = []
+    last_validate_time = 0.0
+
+    def maybe_flush_depth():
+        if collector.should_flush_by_time(FLUSH_INTERVAL_SECONDS):
+            schedule_flush(collector, pending_writes, symbol, stream_label)
+
+    def maybe_flush_snapshot():
+        if (
+            len(snapshot_writer.buffer) >= snapshot_writer.buffer_size
+            or snapshot_writer.should_flush_by_time(FLUSH_INTERVAL_SECONDS)
+        ):
+            schedule_flush(
+                snapshot_writer, pending_writes, symbol, f"{stream_label}_snapshots"
             )
 
-        flush_remaining(collector, symbol, name)
+    try:
+        while True:
+            try:
+                logger.info("[%s] Connecting to %s stream...", symbol.upper(), stream_label)
 
-        print(
-            f"[{symbol.upper()}] Reconnecting {name} stream in 3 seconds..."
-        )
+                async with aiohttp.ClientSession() as session:
+                    async with websockets.connect(collector.ws_url) as ws:
+                        logger.info("[%s] WebSocket connected.", symbol.upper())
+                        log_event(event_logger, stream_label, "connected")
+                        attempt = 0
 
-        await asyncio.sleep(3)
+                        resyncing = False
 
-
-async def run_trade_collector(symbol: str, buffer_size: int):
-    collector = TradeCollector(symbol=symbol, buffer_size=buffer_size)
-
-    await run_stream_collector(
-        collector,
-        collector.parse_trade,
-        symbol,
-        "trade",
-    )
-
-
-async def run_book_ticker_collector(symbol: str, buffer_size: int):
-    collector = BookTickerCollector(symbol=symbol, buffer_size=buffer_size)
-
-    await run_stream_collector(
-        collector,
-        collector.parse_book_ticker,
-        symbol,
-        "book_ticker",
-    )
-
-
-async def run_depth_collector(symbol: str, buffer_size: int):
-    collector = DepthCollector(symbol=symbol, buffer_size=buffer_size)
-
-    prepare_data_path(collector, symbol, "depth")
-
-    while True:
-        try:
-            print(f"[{symbol.upper()}] Connecting to depth stream...")
-
-            async with aiohttp.ClientSession() as session:
-                async with websockets.connect(collector.ws_url) as ws:
-                    print(f"[{symbol.upper()}] WebSocket connected.")
-
-                    resyncing = False
-
-                    # Resync loop. A sequence gap only invalidates the local
-                    # book, not the connection, so it is enough to pull a
-                    # fresh snapshot here and keep the same websocket.
-                    while True:
-                        if resyncing:
-                            await asyncio.sleep(1)
-
-                        snapshot = await collector.fetch_snapshot(session)
-
-                        collector.load_snapshot(snapshot)
-
-                        print(
-                            f"[{symbol.upper()}] Snapshot loaded | "
-                            f"lastUpdateId={collector.last_update_id} | "
-                            f"bids={len(collector.local_bids)} | "
-                            f"asks={len(collector.local_asks)}"
-                        )
-
-                        while not collector.is_synced:
-                            message = await ws.recv()
-                            data = json.loads(message)
-
-                            depth = collector.parse_depth(data)
-
-                            collector.buffer_pending_update(depth)
-
-                            if collector.add_to_buffer(depth):
-                                await asyncio.to_thread(collector.flush_buffer)
-
-                            if collector.sync_pending_updates():
-                                print(
-                                    f"[{symbol.upper()}] "
-                                    f"Order book synchronized."
-                                )
-
-                                print(
-                                    "Best bid:",
-                                    collector.get_best_bid(),
-                                )
-
-                                print(
-                                    "Best ask:",
-                                    collector.get_best_ask(),
-                                )
-
-                                print(
-                                    "Spread:",
-                                    collector.get_spread(),
-                                )
-
+                        # Resync loop. A sequence gap only invalidates the local
+                        # book, not the connection, so it is enough to pull a
+                        # fresh snapshot here and keep the same websocket.
                         while True:
-                            message = await ws.recv()
-                            data = json.loads(message)
+                            if resyncing:
+                                await asyncio.sleep(1)
 
-                            depth = collector.parse_depth(data)
+                            snapshot = await collector.fetch_snapshot(session)
 
-                            if collector.add_to_buffer(depth):
-                                await asyncio.to_thread(collector.flush_buffer)
+                            collector.load_snapshot(snapshot)
 
-                            success = collector.process_live_update(depth)
+                            logger.info(
+                                "[%s] Snapshot loaded | lastUpdateId=%s | bids=%d | asks=%d",
+                                symbol.upper(),
+                                collector.last_update_id,
+                                len(collector.local_bids),
+                                len(collector.local_asks),
+                            )
 
-                            if not success:
-                                print(
-                                    f"[{symbol.upper()}] "
-                                    f"Order book sync lost. Resyncing "
-                                    f"(keeping the connection)..."
-                                )
+                            sync_ok = True
 
-                                break
+                            while not collector.is_synced:
+                                try:
+                                    message = await asyncio.wait_for(
+                                        ws.recv(), timeout=RECEIVE_TIMEOUT_SECONDS
+                                    )
+                                except asyncio.TimeoutError:
+                                    if collector.is_sync_stalled(
+                                        SYNC_STALL_TIMEOUT_SECONDS
+                                    ):
+                                        logger.warning(
+                                            "[%s] Snapshot too stale to sync after "
+                                            "%.0fs, refetching...",
+                                            symbol.upper(), SYNC_STALL_TIMEOUT_SECONDS,
+                                        )
+                                        log_event(
+                                            event_logger, stream_label, "stale_snapshot",
+                                            f"timeout={SYNC_STALL_TIMEOUT_SECONDS}s",
+                                        )
+                                        sync_ok = False
+                                        break
+                                    continue
 
-                        resyncing = True
+                                data = json.loads(message)
+                                depth = collector.parse_depth(data)
 
-        except asyncio.CancelledError:
-            flush_remaining(collector, symbol, "depth")
-            raise
+                                collector.buffer_pending_update(depth)
 
-        except KeyboardInterrupt:
-            flush_remaining(collector, symbol, "depth")
-            raise
+                                if collector.add_to_buffer(depth):
+                                    schedule_flush(
+                                        collector, pending_writes, symbol, stream_label
+                                    )
+                                else:
+                                    maybe_flush_depth()
 
-        except Exception as exc:
-            print(
-                f"[{symbol.upper()}] Connection error: "
-                f"{type(exc).__name__}: {exc}"
-            )
+                                if collector.sync_pending_updates():
+                                    logger.info(
+                                        "[%s] Order book synchronized.", symbol.upper()
+                                    )
+                                    log_event(event_logger, stream_label, "synced")
+                                    logger.info(
+                                        "[%s] Best bid: %s | Best ask: %s | Spread: %s",
+                                        symbol.upper(),
+                                        collector.get_best_bid(),
+                                        collector.get_best_ask(),
+                                        collector.get_spread(),
+                                    )
 
-        flush_remaining(collector, symbol, "depth")
+                            if not sync_ok:
+                                resyncing = True
+                                continue
 
-        print(
-            f"[{symbol.upper()}] Reconnecting in 3 seconds..."
-        )
+                            while True:
+                                try:
+                                    message = await asyncio.wait_for(
+                                        ws.recv(), timeout=RECEIVE_TIMEOUT_SECONDS
+                                    )
+                                except asyncio.TimeoutError:
+                                    maybe_flush_depth()
+                                    continue
 
-        await asyncio.sleep(3)
+                                data = json.loads(message)
+                                depth = collector.parse_depth(data)
+
+                                if collector.add_to_buffer(depth):
+                                    schedule_flush(
+                                        collector, pending_writes, symbol, stream_label
+                                    )
+                                else:
+                                    maybe_flush_depth()
+
+                                success = collector.process_live_update(depth)
+
+                                if not success:
+                                    logger.warning(
+                                        "[%s] Order book sync lost. Resyncing "
+                                        "(keeping the connection)...",
+                                        symbol.upper(),
+                                    )
+                                    log_event(event_logger, stream_label, "sequence_gap")
+                                    break
+
+                                now = time.time()
+
+                                if snapshot_writer.should_capture():
+                                    snapshot_writer.capture(collector)
+                                    maybe_flush_snapshot()
+
+                                if (now - last_validate_time) >= VALIDATION_INTERVAL_SECONDS:
+                                    last_validate_time = now
+                                    validate_local_book(
+                                        collector, refs, event_logger, symbol
+                                    )
+
+                            resyncing = True
+
+            except asyncio.CancelledError:
+                raise
+
+            except Exception as exc:
+                logger.warning(
+                    "[%s] Connection error: %s: %s",
+                    symbol.upper(), type(exc).__name__, exc,
+                )
+                log_event(
+                    event_logger, stream_label, "connection_error",
+                    f"{type(exc).__name__}: {exc}",
+                )
+
+            attempt += 1
+            delay = backoff_delay(attempt)
+            logger.info("[%s] Reconnecting in %.1fs...", symbol.upper(), delay)
+            await asyncio.sleep(delay)
+
+    except asyncio.CancelledError:
+        await drain_pending_writes(pending_writes)
+        await flush_remaining(collector, symbol, stream_label)
+        await flush_remaining(snapshot_writer, symbol, f"{stream_label}_snapshots")
+        raise
+
+    finally:
+        await drain_pending_writes(pending_writes)
+
+
+async def run_futures_depth_collector(
+    symbol: str, buffer_size: int, data_dir: Path, event_logger=None, refs=None
+):
+    await run_depth_collector(
+        symbol, buffer_size, data_dir, event_logger, refs, market="futures"
+    )
+
+
+async def run_event_logger_task(event_logger: EventLogger):
+    try:
+        while True:
+            await asyncio.sleep(EVENTS_FLUSH_INTERVAL_SECONDS)
+
+            if (
+                event_logger.buffer
+                and (
+                    len(event_logger.buffer) >= event_logger.buffer_size
+                    or event_logger.should_flush_by_time(EVENTS_FLUSH_INTERVAL_SECONDS)
+                )
+            ):
+                await asyncio.to_thread(event_logger.flush_buffer)
+
+    except asyncio.CancelledError:
+        await asyncio.to_thread(event_logger.flush_buffer)
+        raise
+
+
+async def run_time_sync_task(event_logger: EventLogger):
+    """
+    Periodically compares Binance's server clock to the local clock and
+    records the offset, so latency figures computed from local_receive_time
+    can be corrected for clock drift later.
+    """
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            while True:
+                try:
+                    offset_ms = await measure_clock_offset(session)
+                    log_event(
+                        event_logger, "time_sync", "clock_offset_ms", str(offset_ms)
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning(
+                        "Time sync check failed: %s: %s", type(exc).__name__, exc
+                    )
+
+                await asyncio.sleep(TIME_SYNC_INTERVAL_SECONDS)
+
+    except asyncio.CancelledError:
+        raise
+
+
+async def run_exchange_info_task(symbols: list, data_dir: Path):
+    recorder = ExchangeInfoRecorder(symbols=symbols, data_dir=data_dir)
+    prepare_data_path(recorder, "_GLOBAL", "exchange_info")
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            while True:
+                try:
+                    await recorder.fetch_and_flush(session)
+                    logger.info(
+                        "[_GLOBAL] Recorded exchangeInfo for %s", ", ".join(symbols)
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning(
+                        "exchangeInfo fetch failed: %s: %s", type(exc).__name__, exc
+                    )
+
+                await asyncio.sleep(EXCHANGE_INFO_INTERVAL_SECONDS)
+
+    except asyncio.CancelledError:
+        raise
 
 
 STREAM_RUNNERS = {
     "depth": run_depth_collector,
     "trade": run_trade_collector,
     "book_ticker": run_book_ticker_collector,
+    "depth20": run_depth20_collector,
+    "futures_depth": run_futures_depth_collector,
+    "futures_agg_trade": run_futures_agg_trade_collector,
+    "futures_mark_price": run_futures_mark_price_collector,
+    "futures_liquidation": run_futures_liquidation_collector,
+    "futures_open_interest": run_futures_open_interest_collector,
 }
 
 
@@ -294,6 +733,7 @@ async def main():
     args = parse_args()
 
     symbols = unique_symbols(args.symbol)
+    data_dir = Path(args.data_dir) if args.data_dir else Path.cwd()
 
     streams = [
         stream
@@ -301,38 +741,87 @@ async def main():
         if stream in args.streams
     ]
 
-    print("=" * 60)
-    print("Crypto Market Data Recorder")
-    print(f"Symbols: {', '.join(s.upper() for s in symbols)}")
-    print(f"Streams: {', '.join(streams)}")
-    print(f"Buffer size: {args.buffer_size}")
-    print(f"Connections: {len(symbols) * len(streams)}")
-    print("Press Ctrl+C to stop")
-    print("=" * 60)
+    logger.info("=" * 60)
+    logger.info("Crypto Market Data Recorder")
+    logger.info("Symbols: %s", ", ".join(s.upper() for s in symbols))
+    logger.info("Streams: %s", ", ".join(streams))
+    logger.info("Buffer size: %d", args.buffer_size)
+    logger.info("Data dir: %s", data_dir)
+    logger.info("Connections: %d", len(symbols) * len(streams))
+    logger.info("Press Ctrl+C to stop")
+    logger.info("=" * 60)
+
+    event_loggers = {
+        symbol: EventLogger(symbol=symbol, data_dir=data_dir) for symbol in symbols
+    }
+    global_event_logger = EventLogger(symbol="GLOBAL", data_dir=data_dir)
+
+    refs = {symbol: {} for symbol in symbols}
 
     tasks = [
         asyncio.create_task(
-            STREAM_RUNNERS[stream](symbol, args.buffer_size),
+            STREAM_RUNNERS[stream](
+                symbol,
+                args.buffer_size,
+                data_dir,
+                event_loggers[symbol],
+                refs[symbol],
+            ),
             name=f"{symbol}:{stream}",
         )
         for symbol in symbols
         for stream in streams
     ]
 
+    tasks += [
+        asyncio.create_task(
+            run_event_logger_task(event_loggers[symbol]), name=f"{symbol}:events"
+        )
+        for symbol in symbols
+    ]
+
+    tasks.append(
+        asyncio.create_task(run_event_logger_task(global_event_logger), name="global:events")
+    )
+    tasks.append(
+        asyncio.create_task(run_time_sync_task(global_event_logger), name="global:time_sync")
+    )
+    tasks.append(
+        asyncio.create_task(
+            run_exchange_info_task(symbols, data_dir), name="global:exchange_info"
+        )
+    )
+
+    loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
+
+    def _request_stop(sig_name: str):
+        logger.info("Received %s, shutting down...", sig_name)
+        stop_event.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _request_stop, sig.name)
+        except NotImplementedError:
+            # Signal handlers aren't available on some platforms (e.g. Windows).
+            pass
+
+    stopper = asyncio.create_task(stop_event.wait())
+
     try:
-        await asyncio.gather(*tasks)
+        await asyncio.wait(
+            [stopper, *tasks], return_when=asyncio.FIRST_COMPLETED
+        )
 
     finally:
+        stopper.cancel()
+
         for task in tasks:
             if not task.done():
                 task.cancel()
 
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(*tasks, stopper, return_exceptions=True)
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-
-    except KeyboardInterrupt:
-        print("\nStopping recorder...")
+    asyncio.run(main())
